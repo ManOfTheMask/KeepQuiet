@@ -24,6 +24,33 @@ import openpgp from 'openpgp'; // Import OpenPGP for cryptographic operations
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 
+type CallRoomType = 'dm' | 'group';
+
+interface CallParticipant {
+    userId: string;
+    username: string;
+    ws: WebSocket;
+    roomType: CallRoomType;
+    roomId: string;
+    publicKey: string | null;
+}
+
+interface WsSessionState {
+    userId: string;
+    username: string;
+    activeCallRoomKey: string | null;
+}
+
+interface PendingCallInvite {
+    inviteId: string;
+    fromUserId: string;
+    fromUsername: string;
+    toUserId: string;
+    conversationType: CallRoomType;
+    conversationId: string;
+    timeout: NodeJS.Timeout;
+}
+
 // Extend SessionData to include custom properties
 declare module 'express-session' {
     interface SessionData {
@@ -74,8 +101,27 @@ mongoose.connect(dbUri)
 const session_secret = process.env.SESSION_SECRET || 'default-secret'; // Use a default secret if not set in environment variables
 const sessionStore = new session.MemoryStore();
 
+interface IceServerEntry { urls: string | string[]; username?: string; credential?: string }
+const ICE_SERVERS: IceServerEntry[] = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+];
+
+if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    ICE_SERVERS.push({
+        urls: process.env.TURN_URL.split(','),
+        username: process.env.TURN_USERNAME,
+        credential: process.env.TURN_CREDENTIAL,
+    });
+}
+
+const ICE_SERVERS_JSON = JSON.stringify(ICE_SERVERS);
+
 // ── WebSocket helpers ──────────────────────────────────────────────────────────
 const connectedUsers = new Map<string, Set<WebSocket>>();
+const callRooms = new Map<string, Map<string, CallParticipant>>();
+const socketState = new Map<WebSocket, WsSessionState>();
+const CALL_INVITE_TIMEOUT_MS = 30_000;
+const pendingCallInvites = new Map<string, PendingCallInvite>();
 
 function addUserSocket(userId: string, ws: WebSocket) {
     if (!connectedUsers.has(userId)) connectedUsers.set(userId, new Set());
@@ -93,6 +139,394 @@ function broadcastToUser(userId: string, data: object) {
     const msg = JSON.stringify(data);
     for (const ws of sockets) {
         if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    }
+}
+
+function sendWsJson(ws: WebSocket, data: object) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+}
+
+function makeCallRoomKey(roomType: CallRoomType, roomId: string): string {
+    return `${roomType}:${roomId}`;
+}
+
+function parseCallRoomKey(roomKey: string): { roomType: CallRoomType; roomId: string } {
+    const [roomType, ...rest] = roomKey.split(':');
+    return { roomType: roomType as CallRoomType, roomId: rest.join(':') };
+}
+
+function broadcastCallRoom(roomKey: string, data: object, excludeUserId?: string) {
+    const room = callRooms.get(roomKey);
+    if (!room) return;
+    for (const [uid, participant] of room.entries()) {
+        if (excludeUserId && uid === excludeUserId) continue;
+        sendWsJson(participant.ws, data);
+    }
+}
+
+function clearPendingCallInvite(inviteId: string): PendingCallInvite | null {
+    const invite = pendingCallInvites.get(inviteId);
+    if (!invite) return null;
+    clearTimeout(invite.timeout);
+    pendingCallInvites.delete(inviteId);
+    return invite;
+}
+
+function clearPendingCallInvitesForUser(userId: string) {
+    for (const [inviteId, invite] of pendingCallInvites.entries()) {
+        if (invite.fromUserId !== userId && invite.toUserId !== userId) continue;
+        clearPendingCallInvite(inviteId);
+    }
+}
+
+function clearPendingCallInvitesForJoin(
+    toUserId: string,
+    acceptedUsername: string,
+    conversationType: CallRoomType,
+    conversationId: string,
+) {
+    for (const [inviteId, invite] of pendingCallInvites.entries()) {
+        if (invite.toUserId !== toUserId) continue;
+        if (invite.conversationType !== conversationType || invite.conversationId !== conversationId) continue;
+        const resolved = clearPendingCallInvite(inviteId);
+        if (!resolved) continue;
+        broadcastToUser(resolved.fromUserId, {
+            type: 'call_accepted',
+            byUserId: resolved.toUserId,
+            byUsername: acceptedUsername,
+            conversationType: resolved.conversationType,
+            conversationId: resolved.conversationId,
+        });
+    }
+}
+
+async function isUserAuthorizedForCall(roomType: CallRoomType, roomId: string, userId: string): Promise<boolean> {
+    if (!mongoose.Types.ObjectId.isValid(roomId) || !mongoose.Types.ObjectId.isValid(userId)) return false;
+
+    const uid = new mongoose.Types.ObjectId(userId);
+    if (roomType === 'dm') {
+        const conversation = await ConversationModel.findOne({
+            _id: new mongoose.Types.ObjectId(roomId),
+            participants: uid,
+        })
+            .select('_id')
+            .lean();
+        return !!conversation;
+    }
+
+    const group = await GroupConversationModel.findOne({
+        _id: new mongoose.Types.ObjectId(roomId),
+        'members.userId': uid,
+    })
+        .select('_id')
+        .lean();
+    return !!group;
+}
+
+async function getCallMemberUserIds(roomType: CallRoomType, roomId: string): Promise<string[]> {
+    if (!mongoose.Types.ObjectId.isValid(roomId)) return [];
+
+    if (roomType === 'dm') {
+        const conversation = await ConversationModel.findById(roomId)
+            .select('participants')
+            .lean();
+        if (!conversation) return [];
+        return (conversation.participants as any[]).map((id: any) => id.toString());
+    }
+
+    const group = await GroupConversationModel.findById(roomId)
+        .select('members.userId')
+        .lean();
+    if (!group) return [];
+    return (group.members as any[]).map((m: any) => m.userId.toString());
+}
+
+function removeSocketFromCall(ws: WebSocket, reason: 'left' | 'disconnect' = 'left') {
+    const state = socketState.get(ws);
+    if (!state?.activeCallRoomKey) return;
+
+    const roomKey = state.activeCallRoomKey;
+    const room = callRooms.get(roomKey);
+    if (!room) {
+        state.activeCallRoomKey = null;
+        return;
+    }
+
+    const participant = room.get(state.userId);
+    if (participant?.ws !== ws) {
+        state.activeCallRoomKey = null;
+        return;
+    }
+
+    room.delete(state.userId);
+    if (room.size === 0) {
+        callRooms.delete(roomKey);
+    }
+
+    const { roomType, roomId } = parseCallRoomKey(roomKey);
+    broadcastCallRoom(
+        roomKey,
+        {
+            type: 'call_user_left',
+            conversationType: roomType,
+            conversationId: roomId,
+            userId: state.userId,
+            username: state.username,
+            reason,
+        },
+        state.userId,
+    );
+
+    state.activeCallRoomKey = null;
+}
+
+async function handleCallJoin(ws: WebSocket, payload: any) {
+    const state = socketState.get(ws);
+    if (!state) return;
+
+    const conversationType: CallRoomType = payload?.conversationType;
+    const conversationId: string = payload?.conversationId;
+    const publicKey = typeof payload?.publicKey === 'string' ? payload.publicKey : null;
+
+    if ((conversationType !== 'dm' && conversationType !== 'group') || !conversationId) {
+        sendWsJson(ws, { type: 'call_error', message: 'Invalid call room payload.' });
+        return;
+    }
+
+    const authorized = await isUserAuthorizedForCall(conversationType, conversationId, state.userId);
+    if (!authorized) {
+        sendWsJson(ws, { type: 'call_error', message: 'Unauthorized call join.' });
+        return;
+    }
+
+    const roomKey = makeCallRoomKey(conversationType, conversationId);
+
+    clearPendingCallInvitesForJoin(state.userId, state.username, conversationType, conversationId);
+
+    if (state.activeCallRoomKey && state.activeCallRoomKey !== roomKey) {
+        removeSocketFromCall(ws, 'left');
+    }
+
+    if (!callRooms.has(roomKey)) callRooms.set(roomKey, new Map());
+    const room = callRooms.get(roomKey)!;
+
+    const existing = room.get(state.userId);
+    if (!existing && room.size >= 10) {
+        sendWsJson(ws, { type: 'call_error', message: 'Call is full (10 participants max).' });
+        return;
+    }
+
+    if (existing && existing.ws !== ws) {
+        const oldState = socketState.get(existing.ws);
+        if (oldState) oldState.activeCallRoomKey = null;
+        sendWsJson(existing.ws, { type: 'call_replaced', conversationType, conversationId });
+    }
+
+    room.set(state.userId, {
+        userId: state.userId,
+        username: state.username,
+        ws,
+        roomType: conversationType,
+        roomId: conversationId,
+        publicKey,
+    });
+    state.activeCallRoomKey = roomKey;
+
+    const participants = Array.from(room.values())
+        .filter((p) => p.userId !== state.userId)
+        .map((p) => ({ userId: p.userId, username: p.username, publicKey: p.publicKey }));
+
+    sendWsJson(ws, {
+        type: 'call_room_state',
+        conversationType,
+        conversationId,
+        participants,
+    });
+
+    broadcastCallRoom(
+        roomKey,
+        {
+            type: 'call_user_joined',
+            conversationType,
+            conversationId,
+            userId: state.userId,
+            username: state.username,
+            publicKey,
+        },
+        state.userId,
+    );
+}
+
+function handleCallRelay(ws: WebSocket, payload: any, relayType: 'call_offer' | 'call_answer' | 'call_ice_candidate') {
+    const state = socketState.get(ws);
+    if (!state?.activeCallRoomKey) {
+        sendWsJson(ws, { type: 'call_error', message: 'Join a call first.' });
+        return;
+    }
+
+    const room = callRooms.get(state.activeCallRoomKey);
+    if (!room) {
+        state.activeCallRoomKey = null;
+        sendWsJson(ws, { type: 'call_error', message: 'Call room no longer exists.' });
+        return;
+    }
+
+    const to = payload?.to;
+    if (!to || typeof to !== 'string') {
+        sendWsJson(ws, { type: 'call_error', message: 'Relay target is required.' });
+        return;
+    }
+
+    const target = room.get(to);
+    if (!target) {
+        sendWsJson(ws, { type: 'call_error', message: 'Target is not in this call.' });
+        return;
+    }
+
+    const { roomType, roomId } = parseCallRoomKey(state.activeCallRoomKey);
+    const relayPayload: any = {
+        type: relayType,
+        conversationType: roomType,
+        conversationId: roomId,
+        from: state.userId,
+    };
+
+    if (relayType === 'call_offer') relayPayload.offer = payload?.offer;
+    if (relayType === 'call_answer') relayPayload.answer = payload?.answer;
+    if (relayType === 'call_ice_candidate') relayPayload.candidate = payload?.candidate;
+
+    sendWsJson(target.ws, relayPayload);
+}
+
+async function handleCallSocketMessage(ws: WebSocket, data: any) {
+    const type = data?.type;
+    if (typeof type !== 'string') return;
+
+    switch (type) {
+        case 'call_invite': {
+            const state = socketState.get(ws);
+            if (!state) return;
+
+            const conversationType: CallRoomType = data?.conversationType;
+            const conversationId: string = data?.conversationId;
+            if ((conversationType !== 'dm' && conversationType !== 'group') || !conversationId) {
+                sendWsJson(ws, { type: 'call_error', message: 'Invalid call invite payload.' });
+                return;
+            }
+
+            const authorized = await isUserAuthorizedForCall(conversationType, conversationId, state.userId);
+            if (!authorized) {
+                sendWsJson(ws, { type: 'call_error', message: 'Unauthorized call invite.' });
+                return;
+            }
+
+            const memberIds = await getCallMemberUserIds(conversationType, conversationId);
+            for (const memberId of memberIds) {
+                if (memberId === state.userId) continue;
+
+                for (const [existingInviteId, existingInvite] of pendingCallInvites.entries()) {
+                    if (existingInvite.fromUserId !== state.userId) continue;
+                    if (existingInvite.toUserId !== memberId) continue;
+                    if (existingInvite.conversationType !== conversationType || existingInvite.conversationId !== conversationId) continue;
+                    clearPendingCallInvite(existingInviteId);
+                }
+
+                const inviteId = crypto.randomUUID();
+                const timeout = setTimeout(() => {
+                    const expired = clearPendingCallInvite(inviteId);
+                    if (!expired) return;
+
+                    broadcastToUser(expired.fromUserId, {
+                        type: 'call_missed',
+                        toUserId: expired.toUserId,
+                        toUsername: undefined,
+                        conversationType: expired.conversationType,
+                        conversationId: expired.conversationId,
+                    });
+
+                    broadcastToUser(expired.toUserId, {
+                        type: 'call_invite_expired',
+                        inviteId: expired.inviteId,
+                        fromUserId: expired.fromUserId,
+                        fromUsername: expired.fromUsername,
+                        conversationType: expired.conversationType,
+                        conversationId: expired.conversationId,
+                    });
+                }, CALL_INVITE_TIMEOUT_MS);
+
+                pendingCallInvites.set(inviteId, {
+                    inviteId,
+                    fromUserId: state.userId,
+                    fromUsername: state.username,
+                    toUserId: memberId,
+                    conversationType,
+                    conversationId,
+                    timeout,
+                });
+
+                broadcastToUser(memberId, {
+                    type: 'call_incoming',
+                    inviteId,
+                    fromUserId: state.userId,
+                    fromUsername: state.username,
+                    conversationType,
+                    conversationId,
+                    timeoutMs: CALL_INVITE_TIMEOUT_MS,
+                });
+            }
+            return;
+        }
+        case 'call_decline': {
+            const state = socketState.get(ws);
+            if (!state) return;
+
+            const toUserId: string | undefined = data?.toUserId;
+            const inviteId: string | undefined = data?.inviteId;
+            const conversationType: CallRoomType = data?.conversationType;
+            const conversationId: string = data?.conversationId;
+
+            if (!toUserId || !conversationId || (conversationType !== 'dm' && conversationType !== 'group')) {
+                return;
+            }
+
+            const authorized = await isUserAuthorizedForCall(conversationType, conversationId, state.userId);
+            if (!authorized) return;
+
+            if (inviteId) {
+                const invite = pendingCallInvites.get(inviteId);
+                if (invite && invite.toUserId === state.userId && invite.fromUserId === toUserId) {
+                    clearPendingCallInvite(inviteId);
+                }
+            } else {
+                for (const [existingInviteId, invite] of pendingCallInvites.entries()) {
+                    if (invite.toUserId !== state.userId || invite.fromUserId !== toUserId) continue;
+                    if (invite.conversationType !== conversationType || invite.conversationId !== conversationId) continue;
+                    clearPendingCallInvite(existingInviteId);
+                }
+            }
+
+            broadcastToUser(toUserId, {
+                type: 'call_declined',
+                byUserId: state.userId,
+                byUsername: state.username,
+                conversationType,
+                conversationId,
+            });
+            return;
+        }
+        case 'call_join':
+            await handleCallJoin(ws, data);
+            return;
+        case 'call_leave':
+            removeSocketFromCall(ws, 'left');
+            return;
+        case 'call_offer':
+        case 'call_answer':
+        case 'call_ice_candidate':
+            handleCallRelay(ws, data, type);
+            return;
+        default:
+            return;
     }
 }
 
@@ -532,7 +966,13 @@ app.get('/chat', requireAuth, async (req: Request, res: Response) => {
             return 0;
         });
 
-        res.render('chat', { title: 'Chat', script: 'chat', conversations: allConvos, currentUserId: userId });
+        res.render('chat', {
+            title: 'Chat',
+            script: 'chat',
+            conversations: allConvos,
+            currentUserId: userId,
+            iceServersJson: ICE_SERVERS_JSON,
+        });
     } catch (error) {
         console.error('Error loading chat page:', error);
         res.status(500).send('Internal server error.');
@@ -1201,22 +1641,52 @@ wss.on('connection', (ws, req) => {
     const sessionId = unsignSessionCookie(rawSid, session_secret);
     if (!sessionId) { ws.close(1008, 'Unauthorized'); return; }
 
-    sessionStore.get(sessionId, (err, sess) => {
-        if (err || !sess?.authenticated || !sess?.userId) {
-            ws.close(1008, 'Unauthorized');
-            return;
+    sessionStore.get(sessionId, async (err, sess) => {
+        try {
+            if (err || !sess?.authenticated || !sess?.userId) {
+                ws.close(1008, 'Unauthorized');
+                return;
+            }
+            const userId = sess.userId;
+            const user = await UserModel.findById(userId).select('username').lean();
+            const username = user?.username ?? 'Unknown';
+
+            addUserSocket(userId, ws);
+            socketState.set(ws, { userId, username, activeCallRoomKey: null });
+
+            // Track whether this client is still alive between pings
+            (ws as any).isAlive = true;
+            ws.on('message', async (data) => {
+                if (data.toString() === '__pong__') {
+                    (ws as any).isAlive = true;
+                    return;
+                }
+
+                let parsed: any;
+                try {
+                    parsed = JSON.parse(data.toString());
+                } catch {
+                    return;
+                }
+
+                await handleCallSocketMessage(ws, parsed);
+            });
+
+            ws.on('close', () => {
+                removeSocketFromCall(ws, 'disconnect');
+                clearPendingCallInvitesForUser(userId);
+                socketState.delete(ws);
+                removeUserSocket(userId, ws);
+            });
+            ws.on('error', () => {
+                removeSocketFromCall(ws, 'disconnect');
+                clearPendingCallInvitesForUser(userId);
+                socketState.delete(ws);
+                removeUserSocket(userId, ws);
+            });
+        } catch {
+            ws.close(1011, 'Session setup failed');
         }
-        const userId = sess.userId;
-        addUserSocket(userId, ws);
-
-        // Track whether this client is still alive between pings
-        (ws as any).isAlive = true;
-        ws.on('message', (data) => {
-            if (data.toString() === '__pong__') (ws as any).isAlive = true;
-        });
-
-        ws.on('close', () => removeUserSocket(userId, ws));
-        ws.on('error', () => removeUserSocket(userId, ws));
     });
 });
 

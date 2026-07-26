@@ -76,7 +76,7 @@ describe('FriendController.sendFriendRequest', () => {
 
 // ── acceptFriendRequest ───────────────────────────────────────────────────────
 describe('FriendController.acceptFriendRequest', () => {
-  it('sets status to accepted and adds each user to the other\'s friends list', async () => {
+  it('deletes the request and adds each user to the other\'s friends list', async () => {
     const a = await makeUser('key-h', 'Heidi');
     const b = await makeUser('key-i', 'Ivan');
 
@@ -89,7 +89,7 @@ describe('FriendController.acceptFriendRequest', () => {
     expect(updatedB!.friends.map(String)).toContain(a._id.toString());
 
     const updatedReq = await FriendRequestModel.findById(req._id);
-    expect(updatedReq!.status).toBe('accepted');
+    expect(updatedReq).toBeNull();
   });
 
   it('throws when the request does not belong to the accepting user', async () => {
@@ -103,7 +103,7 @@ describe('FriendController.acceptFriendRequest', () => {
     ).rejects.toThrow('Unauthorized.');
   });
 
-  it('throws when accepting a non-pending request', async () => {
+  it('throws when accepting an already-resolved request', async () => {
     const a = await makeUser('key-m', 'Mallory');
     const b = await makeUser('key-n', 'Niaj');
 
@@ -111,7 +111,7 @@ describe('FriendController.acceptFriendRequest', () => {
     await FriendController.acceptFriendRequest(req._id.toString(), b._id.toString());
     await expect(
       FriendController.acceptFriendRequest(req._id.toString(), b._id.toString()),
-    ).rejects.toThrow('This request has already been resolved.');
+    ).rejects.toThrow('Friend request not found.');
   });
 
   it('throws when the request id does not exist', async () => {
@@ -125,7 +125,7 @@ describe('FriendController.acceptFriendRequest', () => {
 
 // ── declineFriendRequest ──────────────────────────────────────────────────────
 describe('FriendController.declineFriendRequest', () => {
-  it('sets status to declined', async () => {
+  it('deletes the request when declined', async () => {
     const a = await makeUser('key-p', 'Peggy');
     const b = await makeUser('key-q', 'Quinn');
 
@@ -133,7 +133,7 @@ describe('FriendController.declineFriendRequest', () => {
     await FriendController.declineFriendRequest(req._id.toString(), b._id.toString());
 
     const updated = await FriendRequestModel.findById(req._id);
-    expect(updated!.status).toBe('declined');
+    expect(updated).toBeNull();
   });
 
   it('throws for unauthorized user', async () => {

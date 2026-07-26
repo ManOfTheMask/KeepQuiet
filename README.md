@@ -23,6 +23,14 @@ KeepQuiet is a self-hostable, end-to-end encrypted messaging application. All en
 - **Profile page** — displays your username, member-since date, and your full ASCII-armored PGP public key with a one-click copy-to-clipboard button
 - **Profile pictures (avatars)** — upload/crop a profile picture from the profile page; avatars are shown on the dashboard and in chat
 - **Group chats** — multi-participant E2EE conversations with up to 10 members; each member's public key forms a shared key ring so messages are encrypted for every participant; members can invite others, leave, or rename the group; the group admin can kick members and delete the group
+- **Voice/video calls for DMs and groups (up to 10 people)** — WebRTC-based encrypted calls integrated into the chat view with participant list, mute/camera controls, and leave handling
+- **Unified chat + call layout** — calls run inside the same chat screen (not a separate page/modal), so users can text and talk at the same time
+- **Resizable call/chat split** — users can drag the splitter to show more call area or more message area
+- **Persistent in-view call controls** — call buttons stay visible while resizing
+- **Incoming call flow** — real-time call invite modal with **Accept** / **Decline**, caller feedback for accepts/declines, and invite-expiry handling
+- **Missed-call signaling** — unanswered invites expire automatically and emit caller/callee status events
+- **Screen sharing** — optional in-call display sharing with one-click start/stop and automatic camera restore
+- **Camera-off by default in calls** — users join calls with camera disabled until they explicitly enable it
 - **Account deletion** — permanently delete your account (requires PGP key + passphrase verification); cleans up all associated data including friends, DMs, group memberships, and notifications
 
 ---
@@ -66,6 +74,24 @@ KeepQuiet uses a **PGP challenge-response** flow instead of passwords:
 - If the admin leaves, the longest-standing remaining member is automatically promoted.
 - Deleting the group hard-deletes all group messages and the group document.
 
+### Voice / Video Calls
+- Calls are available inside both DMs and group chats.
+- Group and call capacity is limited to **10 participants**.
+- The call view is embedded directly in the chat window and appears above the message pane.
+- A resize handle lets users adjust the split between call content and text chat.
+- Call controls remain visible while resizing.
+- Joining a call requires authorization against conversation membership (DM participant or group member).
+- Peer negotiation includes reconnection-safe handling to improve reliability for users joining active calls.
+- Call invites are delivered in real time over WebSocket:
+   - Recipients can **Accept** or **Decline**.
+   - Accepting joins the call room and notifies the caller.
+   - Declining notifies the caller immediately.
+   - Unanswered invites automatically expire after a timeout and emit missed/expired events.
+- Media transport uses WebRTC peer connections with ICE/STUN (and optional TURN relay).
+- In-call controls include mute/unmute, camera on/off, screen share, and leave call.
+- Camera starts **off by default** until the user enables it.
+- Stopping screen share exits smoothly and restores the camera track without spurious warnings.
+
 ### Account Deletion
 - Users can permanently delete their account from the Profile page.
 - Deletion requires uploading the private key and entering the passphrase to verify ownership.
@@ -92,6 +118,25 @@ All real-time communication goes through a single WebSocket endpoint at `/ws`. T
 | Server → Client | `group_member_removed` | `{ groupId, userId }` |
 | Server → Client | `group_deleted` | `{ groupId }` |
 | Server → Client | `group_renamed` | `{ groupId, name }` |
+
+#### Call signaling events
+| Direction | Event type | Payload |
+|---|---|---|
+| Client → Server | `call_invite` | `{ conversationType, conversationId }` |
+| Server → Client | `call_incoming` | `{ inviteId, fromUserId, fromUsername, conversationType, conversationId, timeoutMs }` |
+| Client → Server | `call_join` | `{ conversationType, conversationId, publicKey? }` |
+| Server → Client | `call_room_state` | `{ conversationType, conversationId, participants[] }` |
+| Server → Client | `call_user_joined` | `{ conversationType, conversationId, userId, username, publicKey? }` |
+| Server → Client | `call_user_left` | `{ conversationType, conversationId, userId, username, reason }` |
+| Client ↔ Server | `call_offer` | `{ conversationType, conversationId, to/from, offer }` |
+| Client ↔ Server | `call_answer` | `{ conversationType, conversationId, to/from, answer }` |
+| Client ↔ Server | `call_ice_candidate` | `{ conversationType, conversationId, to/from, candidate }` |
+| Client → Server | `call_decline` | `{ inviteId, toUserId, conversationType, conversationId }` |
+| Server → Client | `call_declined` | `{ byUserId, byUsername, conversationType, conversationId }` |
+| Server → Client | `call_accepted` | `{ byUserId, byUsername, conversationType, conversationId }` |
+| Server → Client | `call_missed` | `{ toUserId, conversationType, conversationId }` |
+| Server → Client | `call_invite_expired` | `{ inviteId, fromUserId, fromUsername, conversationType, conversationId }` |
+| Server → Client | `call_error` | `{ message }` |
 
 Connections that miss two consecutive pings are terminated automatically.
 
@@ -255,6 +300,10 @@ Connections that miss two consecutive pings are terminated automatically.
 | `PATCH` | `/group/:groupId/name` | Rename the group (any member) |
 | `DELETE` | `/group/:groupId` | Delete the group entirely (admin only) |
 
+### Call Transport (WebSocket)
+Call signaling is handled over the existing authenticated WebSocket endpoint at `/ws`.
+There are no separate REST call routes; call state is synchronized via the event protocol documented above.
+
 ---
 
 ## How To Run
@@ -276,6 +325,10 @@ Connections that miss two consecutive pings are terminated automatically.
    ```env
    MONGO_URI="mongodb://localhost:27017/KeepQuiet"
    SESSION_SECRET="your-session-secret"
+   # Optional TURN relay (recommended for restrictive NAT/firewalls)
+   TURN_URL="turn:your-turn.example.com:3478,turns:your-turn.example.com:5349"
+   TURN_USERNAME="your-turn-username"
+   TURN_CREDENTIAL="your-turn-password"
    ```
 
 3. **Run the application:**
@@ -298,8 +351,23 @@ Connections that miss two consecutive pings are terminated automatically.
 - **Read receipts** — show when a message has been seen by the recipient
 - **File / image sharing** — encrypted attachment support
 - **Notification preferences** — per-conversation mute and global notification settings
-- **E2EE Voice & Video Chat** — E2EE Voice & Video Chat for 10 people
+- ~~**E2EE Voice & Video Chat** — E2EE Voice & Video Chat for 10 people~~
+- ~~**Call invites + timeout handling** — incoming call modal, accept/decline, missed/expired statuses~~
+- ~~**Screen sharing in calls** — switch outgoing video track to display capture and restore camera~~
 - **Mobile app** — a native wrapper (e.g. Capacitor or Tauri) around the existing web UI
+
+---
+
+## Tests Added
+
+- Added call signaling lifecycle coverage in `src/Tests/callsignaling.test.ts`.
+- Covered scenarios:
+   - authorized invite delivery
+   - accept flow on join
+   - decline flow
+   - invite timeout -> missed/expired events
+   - signaling relay authorization
+   - leave notifications
 
 ---
 

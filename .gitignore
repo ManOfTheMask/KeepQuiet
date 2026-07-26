@@ -8,3 +8,4 @@ tsconfig.client.tsbuildinfo
 tsconfig.server.tsbuildinfo
 tsconfig.tsbuildinfo
 .env
+e2ewebcamdemoexample
