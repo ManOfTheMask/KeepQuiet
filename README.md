@@ -19,6 +19,7 @@ KeepQuiet is a self-hostable, end-to-end encrypted messaging application. All en
 - **Friends system** — send, accept, and decline friend requests by sharing your public key; remove friends and permanently delete your conversation with them in one action
 - **Conversation management** — pin conversations, close a DM (with the option to delete all messages), and re-open it later by messaging the same friend again
 - **Message deletion** — soft-delete individual messages; deleted messages show a placeholder to all participants
+- **Read receipts (DMs + groups)** — sent messages show delivery/read state; DMs use checkmarks and groups show per-reader chips with timestamps
 - **Dashboard** — logged-in users see a summary of stats (friend count, messages sent, unread notifications, pending requests), quick-action buttons, and an inline accept/decline panel for incoming friend requests
 - **Profile page** — displays your username, member-since date, and your full ASCII-armored PGP public key with a one-click copy-to-clipboard button
 - **Profile pictures (avatars)** — upload/crop a profile picture from the profile page; avatars are shown on the dashboard and in chat
@@ -50,6 +51,9 @@ KeepQuiet uses a **PGP challenge-response** flow instead of passwords:
 - Conversations are 1-to-1 DMs between friends.
 - Messages are encrypted in the browser with the recipient's public key (and your own, so you can read your sent messages) before being sent.
 - Real-time delivery is handled via **WebSockets**. The server stores only encrypted ciphertext.
+- Read receipts are tracked per message using `readBy` entries (`userId`, `readAt`).
+- The client marks messages as read when you view a conversation, then broadcasts a real-time receipt update.
+- In DMs, outgoing messages show single-check (sent) and double-check (read). In groups, outgoing messages show per-reader chips.
 - You can soft-delete any message you sent.
 - You can close a conversation (hide it from your sidebar). When closing, you are prompted to either keep the messages or permanently delete them. Opening a new chat with the same friend restores the conversation.
 
@@ -106,6 +110,7 @@ All real-time communication goes through a single WebSocket endpoint at `/ws`. T
 | Server → Client | `new_message` | `{ conversationId, message: { id, senderUsername, senderId, content, deleted, createdAt } }` |
 | Server → Client | `new_notification` | `{ notification: { id, type, title, body, link, read, createdAt } }` |
 | Server → Client | `message_deleted` | `{ conversationId, messageId }` |
+| Server → Client | `read_receipt` | `{ conversationId, userId, username, readAt }` |
 | Server → Client | `__ping__` | keepalive ping (string literal) |
 | Client → Server | `__pong__` | keepalive response (string literal) |
 
@@ -118,6 +123,7 @@ All real-time communication goes through a single WebSocket endpoint at `/ws`. T
 | Server → Client | `group_member_removed` | `{ groupId, userId }` |
 | Server → Client | `group_deleted` | `{ groupId }` |
 | Server → Client | `group_renamed` | `{ groupId, name }` |
+| Server → Client | `group_read_receipt` | `{ groupId, userId, username, readAt }` |
 
 #### Call signaling events
 | Direction | Event type | Payload |
@@ -186,6 +192,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `senderId` | ObjectId | references User |
 | `content` | string | PGP-encrypted ciphertext |
 | `deletedAt` | datetime | set when soft-deleted; `null` otherwise |
+| `readBy` | `{ userId: ObjectId, readAt: datetime }[]` | users who have read this message |
 | `createdAt` | datetime | |
 
 ### FriendRequest
@@ -224,6 +231,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `senderId` | ObjectId | references User |
 | `content` | string | PGP-encrypted ciphertext (encrypted for every member's key) |
 | `deletedAt` | datetime | set when soft-deleted; `null` otherwise |
+| `readBy` | `{ userId: ObjectId, readAt: datetime }[]` | members who have read this message |
 | `createdAt` | datetime | |
 
 ---
@@ -270,6 +278,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `GET` | `/chat` | Chat page (lists all conversations) |
 | `POST` | `/chat/start` | Get or create a conversation with a friend |
 | `GET` | `/chat/:conversationId/messages` | Load messages for a conversation |
+| `POST` | `/chat/:conversationId/read` | Mark all unread messages in a conversation as read (current user) |
 | `POST` | `/chat/:conversationId/messages` | Send a message |
 | `DELETE` | `/chat/:conversationId/messages/:messageId` | Soft-delete a message |
 | `POST` | `/chat/:conversationId/pin` | Toggle pin for a conversation |
@@ -291,6 +300,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `GET` | `/group/:groupId/info` | Get group info (name, admin, member list) |
 | `GET` | `/group/:groupId/keyring` | Get the array of armored public keys for all members |
 | `GET` | `/group/:groupId/messages` | Load messages for a group |
+| `POST` | `/group/:groupId/read` | Mark all unread messages in a group as read (current user) |
 | `POST` | `/group/:groupId/messages` | Send a message to a group |
 | `DELETE` | `/group/:groupId/messages/:messageId` | Soft-delete a group message (sender only) |
 | `POST` | `/group/:groupId/invite` | Invite a user to the group (any member) |
@@ -348,7 +358,7 @@ There are no separate REST call routes; call state is synchronized via the event
 - ~~**Theme picker** — let users choose from DaisyUI's built-in themes or customise accent colours~~
 - ~~**Group chats** — multi-participant conversations with shared group key management up to 10 people~~
 - **Message reactions** — emoji reactions on individual messages
-- **Read receipts** — show when a message has been seen by the recipient
+- ~~**Read receipts** — show when a message has been seen by the recipient~~
 - **File / image sharing** — encrypted attachment support
 - **Notification preferences** — per-conversation mute and global notification settings
 - ~~**E2EE Voice & Video Chat** — E2EE Voice & Video Chat for 10 people~~

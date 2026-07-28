@@ -262,3 +262,62 @@ describe('ChatController.togglePin', () => {
     ).rejects.toThrow('Conversation not found.');
   });
 });
+
+// ── markMessagesRead ──────────────────────────────────────────────────────────
+describe('ChatController.markMessagesRead', () => {
+  it('adds the calling user to readBy on messages sent by the other participant', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    const msg = await ChatController.sendMessage(conv._id.toString(), userA._id.toString(), 'Hello');
+
+    await ChatController.markMessagesRead(conv._id.toString(), userB._id.toString());
+
+    const updated = await MessageModel.findById(msg._id).lean();
+    expect(updated!.readBy.map((r: any) => r.userId.toString())).toContain(userB._id.toString());
+  });
+
+  it('does not add the calling user to readBy on their own messages', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    const msg = await ChatController.sendMessage(conv._id.toString(), userA._id.toString(), 'Mine');
+
+    await ChatController.markMessagesRead(conv._id.toString(), userA._id.toString());
+
+    const updated = await MessageModel.findById(msg._id).lean();
+    expect(updated!.readBy.map((r: any) => r.userId.toString())).not.toContain(userA._id.toString());
+  });
+
+  it('does not duplicate a readBy entry when called twice', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await ChatController.sendMessage(conv._id.toString(), userA._id.toString(), 'Hello');
+
+    await ChatController.markMessagesRead(conv._id.toString(), userB._id.toString());
+    await ChatController.markMessagesRead(conv._id.toString(), userB._id.toString());
+
+    const messages = await MessageModel.find({ conversationId: conv._id }).lean();
+    const bobEntries = messages[0].readBy.filter((r: any) => r.userId.toString() === userB._id.toString());
+    expect(bobEntries.length).toBe(1);
+  });
+
+  it('returns a readAt timestamp', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await ChatController.sendMessage(conv._id.toString(), userA._id.toString(), 'Tick');
+    const before = new Date();
+    const result = await ChatController.markMessagesRead(conv._id.toString(), userB._id.toString());
+    const after = new Date();
+    expect(result.readAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(result.readAt.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
+  it('throws when requester is not a participant', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await expect(
+      ChatController.markMessagesRead(conv._id.toString(), userC._id.toString()),
+    ).rejects.toThrow('Unauthorized.');
+  });
+
+  it('throws when conversation does not exist', async () => {
+    const fakeId = new mongoose.Types.ObjectId().toString();
+    await expect(
+      ChatController.markMessagesRead(fakeId, userA._id.toString()),
+    ).rejects.toThrow('Conversation not found.');
+  });
+});

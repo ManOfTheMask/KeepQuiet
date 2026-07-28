@@ -27,6 +27,16 @@ const groupMessageSchema = new mongoose.Schema({
         type: Date,
         default: Date.now,
     },
+
+    readBy: {
+        type: [
+            {
+                userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+                readAt: { type: Date, required: true },
+            },
+        ],
+        default: [],
+    },
 });
 
 const GroupMessageModel = mongoose.model("GroupMessage", groupMessageSchema);

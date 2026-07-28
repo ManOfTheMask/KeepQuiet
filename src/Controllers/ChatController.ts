@@ -77,8 +77,34 @@ class ChatController {
 
         return await MessageModel.find({ conversationId: cid })
             .populate("senderId", "username")
+            .populate("readBy.userId", "username")
             .sort({ createdAt: 1 })
             .lean();
+    }
+
+    /** Mark all unread messages in a conversation as read for the given user. */
+    async markMessagesRead(conversationId: string, userId: string) {
+        const cid = new mongoose.Types.ObjectId(conversationId);
+        const uid = new mongoose.Types.ObjectId(userId);
+
+        const conv = await ConversationModel.findById(cid).lean();
+        if (!conv) throw new Error("Conversation not found.");
+        if (!(conv.participants as any[]).some((p: any) => p.equals(uid))) {
+            throw new Error("Unauthorized.");
+        }
+
+        const now = new Date();
+        await MessageModel.updateMany(
+            {
+                conversationId: cid,
+                senderId: { $ne: uid },
+                "readBy.userId": { $ne: uid },
+                deletedAt: null,
+            },
+            { $push: { readBy: { userId: uid, readAt: now } } },
+        );
+
+        return { readAt: now };
     }
 
     /** Soft-delete a message (only the sender can delete it). */
