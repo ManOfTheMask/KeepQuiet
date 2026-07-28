@@ -204,6 +204,8 @@ function connectChatWs() {
                 const el = await buildMessageEl(data.message);
                 messagesContainer.appendChild(el);
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                // Mark incoming messages as read immediately since the conversation is open
+                void markConversationRead();
             }
         }
 
@@ -225,6 +227,8 @@ function connectChatWs() {
                 const el = await buildMessageEl(data.message);
                 messagesContainer.appendChild(el);
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                // Mark incoming messages as read immediately since the conversation is open
+                void markConversationRead();
             }
         }
 
@@ -277,6 +281,22 @@ function connectChatWs() {
             if (data.groupId === activeConversationId) {
                 chatHeaderName.textContent = displayName;
                 membersPanelTitle.textContent = displayName;
+            }
+        }
+
+        // DM read receipt — another participant read the messages
+        if (data.type === 'read_receipt') {
+            if (data.conversationId === activeConversationId && activeConversationType === 'dm'
+                && data.userId !== currentUserId) {
+                updateDmReadIndicators(data.userId, data.username, data.readAt);
+            }
+        }
+
+        // Group read receipt — a group member read the messages
+        if (data.type === 'group_read_receipt') {
+            if (data.groupId === activeConversationId && activeConversationType === 'group'
+                && data.userId !== currentUserId) {
+                updateGroupReadIndicators(data.userId, data.username, data.readAt);
             }
         }
     };
@@ -882,6 +902,7 @@ async function openConversation(id: string, item: HTMLElement) {
     renderedMessageIds.clear();
     avatarCache.clear();
     loadMessages(id);
+    void markConversationRead();
 }
 
 async function openGroupConversation(id: string, item: HTMLElement) {
@@ -913,6 +934,7 @@ async function openGroupConversation(id: string, item: HTMLElement) {
 
     await refreshGroupKeyring(id);
     loadGroupMessages(id);
+    void markConversationRead();
 }
 
 // ── Group helpers ─────────────────────────────────────────────────────────────
@@ -1029,6 +1051,8 @@ async function buildMessageEl(msg: {
     content: string | null;
     deleted: boolean;
     createdAt: string;
+    createdAtMs?: number;
+    readBy?: { userId: string; username: string; readAt: string | null }[];
 }) {
     const isMine = currentUserId && msg.senderId === currentUserId;
 
@@ -1056,6 +1080,8 @@ async function buildMessageEl(msg: {
     const li = document.createElement('div');
     li.className = `flex flex-col ${isMine ? 'items-end' : 'items-start'} group`;
     li.dataset.messageId = msg.id;
+    li.dataset.senderId = msg.senderId;
+    if (msg.createdAtMs !== undefined) li.dataset.createdAtMs = String(msg.createdAtMs);
 
     // Row: avatar + bubble
     const row = document.createElement('div');
@@ -1096,6 +1122,14 @@ async function buildMessageEl(msg: {
 
     li.appendChild(row);
     li.appendChild(time);
+
+    // Read receipt indicator (own non-deleted messages only)
+    if (isMine && !msg.deleted) {
+        const readers = (msg.readBy ?? []).filter(r => r.userId !== currentUserId);
+        const indicator = buildReadIndicator(readers);
+        li.appendChild(indicator);
+    }
+
     return li;
 }
 
@@ -1619,6 +1653,105 @@ groupCreateBtn.onclick = async () => {
         groupCreateBtn.disabled = false;
     }
 };
+
+// ── Read receipts ─────────────────────────────────────────────────────────────
+
+/** POST to the server to mark all messages in the active conversation as read. */
+async function markConversationRead() {
+    if (!activeConversationId) return;
+    const url = activeConversationType === 'group'
+        ? `/group/${activeConversationId}/read`
+        : `/chat/${activeConversationId}/read`;
+    try {
+        await fetch(url, { method: 'POST' });
+    } catch { /* non-fatal */ }
+}
+
+/**
+ * Build the read indicator element appended under an outgoing message.
+ * For DMs: single/double checkmark.
+ * For groups: initials chips for each reader.
+ */
+function buildReadIndicator(
+    readers: { userId: string; username: string; readAt: string | null }[],
+): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'read-receipt-indicator flex items-center gap-0.5 mt-0.5 min-h-[1rem]';
+
+    if (activeConversationType === 'dm') {
+        const span = document.createElement('span');
+        if (readers.length > 0) {
+            const r = readers[0];
+            const timeStr = r.readAt
+                ? new Date(r.readAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : '';
+            span.className = 'text-xs text-primary font-medium';
+            span.textContent = '✓✓';
+            span.title = `Read${timeStr ? ` at ${timeStr}` : ''}`;
+        } else {
+            span.className = 'text-xs text-base-content/30';
+            span.textContent = '✓';
+            span.title = 'Sent';
+        }
+        wrap.appendChild(span);
+    } else {
+        // Group: show a chip per reader
+        for (const r of readers) {
+            wrap.appendChild(buildReaderChip(r.userId, r.username, r.readAt));
+        }
+    }
+
+    return wrap;
+}
+
+/** Build a single reader chip (initials circle) for group read indicators. */
+function buildReaderChip(userId: string, username: string, readAt: string | null): HTMLElement {
+    const chip = document.createElement('div');
+    chip.className = 'w-4 h-4 rounded-full bg-primary text-primary-content flex items-center justify-center text-[8px] font-bold flex-shrink-0 cursor-default';
+    chip.dataset.readerId = userId;
+    chip.textContent = username.charAt(0).toUpperCase();
+    const timeStr = readAt
+        ? new Date(readAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '';
+    chip.title = `Read by ${username}${timeStr ? ` at ${timeStr}` : ''}`;
+    return chip;
+}
+
+/** Update all own outgoing DM message indicators to "read" when the recipient reads. */
+function updateDmReadIndicators(readerUserId: string, readerUsername: string, readAt: string) {
+    const timeStr = new Date(readAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const msgEls = messagesContainer.querySelectorAll<HTMLElement>('[data-message-id]');
+    for (const el of msgEls) {
+        if (el.dataset.senderId !== currentUserId) continue;
+        const indicator = el.querySelector<HTMLElement>('.read-receipt-indicator');
+        if (!indicator) continue;
+        indicator.innerHTML = '';
+        const span = document.createElement('span');
+        span.className = 'text-xs text-primary font-medium';
+        span.textContent = '✓✓';
+        span.title = `Read by ${readerUsername} at ${timeStr}`;
+        indicator.appendChild(span);
+    }
+}
+
+/**
+ * Update own outgoing group messages whose `createdAtMs` ≤ `readAt` to add the reader chip.
+ * Skips messages where this reader's chip already exists.
+ */
+function updateGroupReadIndicators(readerUserId: string, readerUsername: string, readAt: string) {
+    const readAtMs = new Date(readAt).getTime();
+    const msgEls = messagesContainer.querySelectorAll<HTMLElement>('[data-message-id]');
+    for (const el of msgEls) {
+        if (el.dataset.senderId !== currentUserId) continue;
+        const elMs = parseInt(el.dataset.createdAtMs ?? '0', 10);
+        if (elMs > readAtMs) continue;
+        const indicator = el.querySelector<HTMLElement>('.read-receipt-indicator');
+        if (!indicator) continue;
+        // Avoid duplicates
+        if (indicator.querySelector(`[data-reader-id="${readerUserId}"]`)) continue;
+        indicator.appendChild(buildReaderChip(readerUserId, readerUsername, readAt));
+    }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function escHtml(str: string) {

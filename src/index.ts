@@ -1012,8 +1012,40 @@ app.get('/chat/:conversationId/messages', requireAuth, async (req: Request, res:
             content: m.deletedAt ? null : m.content,
             deleted: !!m.deletedAt,
             createdAt: new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            createdAtMs: new Date(m.createdAt).getTime(),
+            readBy: (m.readBy ?? []).map((r: any) => ({
+                userId: r.userId?._id?.toString() ?? r.userId?.toString(),
+                username: r.userId?.username ?? 'Unknown',
+                readAt: r.readAt ? new Date(r.readAt).toISOString() : null,
+            })),
         }));
         res.json({ success: true, messages: serialized });
+    } catch (error: any) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+// Mark all messages in a conversation as read for the current user
+app.post('/chat/:conversationId/read', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const uid = req.session.userId!;
+        const { readAt } = await ChatController.markMessagesRead(req.params.conversationId, uid);
+
+        const conv = await ConversationModel.findById(req.params.conversationId);
+        const sender = await UserController.getUserById(uid);
+        if (conv && sender) {
+            const wsMsg = {
+                type: 'read_receipt',
+                conversationId: req.params.conversationId,
+                userId: uid,
+                username: sender.username,
+                readAt: readAt.toISOString(),
+            };
+            for (const participantId of conv.participants as any[]) {
+                broadcastToUser(participantId.toString(), wsMsg);
+            }
+        }
+        res.json({ success: true });
     } catch (error: any) {
         res.status(400).json({ success: false, message: error.message });
     }
@@ -1047,6 +1079,8 @@ app.post('/chat/:conversationId/messages', requireAuth, async (req: Request, res
                     content,
                     deleted: false,
                     createdAt: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                    createdAtMs: new Date(message.createdAt).getTime(),
+                    readBy: [],
                 },
             };
             for (const participantId of conv.participants as any[]) {
@@ -1413,8 +1447,40 @@ app.get('/group/:groupId/messages', requireAuth, async (req: Request, res: Respo
             content: m.deletedAt ? null : m.content,
             deleted: !!m.deletedAt,
             createdAt: new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            createdAtMs: new Date(m.createdAt).getTime(),
+            readBy: (m.readBy ?? []).map((r: any) => ({
+                userId: r.userId?._id?.toString() ?? r.userId?.toString(),
+                username: r.userId?.username ?? 'Unknown',
+                readAt: r.readAt ? new Date(r.readAt).toISOString() : null,
+            })),
         }));
         res.json({ success: true, messages: serialized });
+    } catch (err: any) {
+        res.status(400).json({ success: false, message: err.message });
+    }
+});
+
+// Mark all messages in a group as read for the current user
+app.post('/group/:groupId/read', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const uid = req.session.userId!;
+        const { readAt } = await GroupController.markMessagesRead(req.params.groupId, uid);
+
+        const group = await GroupConversationModel.findById(req.params.groupId).lean();
+        const user = await UserController.getUserById(uid);
+        if (group && user) {
+            const wsMsg = {
+                type: 'group_read_receipt',
+                groupId: req.params.groupId,
+                userId: uid,
+                username: user.username,
+                readAt: readAt.toISOString(),
+            };
+            for (const m of group.members as any[]) {
+                broadcastToUser(m.userId.toString(), wsMsg);
+            }
+        }
+        res.json({ success: true });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
     }
@@ -1443,6 +1509,8 @@ app.post('/group/:groupId/messages', requireAuth, async (req: Request, res: Resp
                     content,
                     deleted: false,
                     createdAt: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                    createdAtMs: new Date(message.createdAt).getTime(),
+                    readBy: [],
                 },
             };
             for (const m of group.members as any[]) {

@@ -88,8 +88,34 @@ class GroupController {
 
         return await GroupMessageModel.find({ groupId: gid })
             .populate("senderId", "username")
+            .populate("readBy.userId", "username")
             .sort({ createdAt: 1 })
             .lean();
+    }
+
+    /** Mark all unread messages in a group as read for the given user. */
+    async markMessagesRead(groupId: string, userId: string) {
+        const gid = new mongoose.Types.ObjectId(groupId);
+        const uid = new mongoose.Types.ObjectId(userId);
+
+        const group = await GroupConversationModel.findById(gid).lean();
+        if (!group) throw new Error("Group not found.");
+
+        const isMember = (group.members as any[]).some((m: any) => m.userId.equals(uid));
+        if (!isMember) throw new Error("Unauthorized.");
+
+        const now = new Date();
+        await GroupMessageModel.updateMany(
+            {
+                groupId: gid,
+                senderId: { $ne: uid },
+                "readBy.userId": { $ne: uid },
+                deletedAt: null,
+            },
+            { $push: { readBy: { userId: uid, readAt: now } } },
+        );
+
+        return { readAt: now };
     }
 
     /** Send a message to a group — must be a member. */
