@@ -1,8 +1,10 @@
+export {};
+
 // notifications.ts — global notification bell logic, loaded on every page for logged-in users
 
 interface AppNotification {
     id: string;
-    type: 'friend_request' | 'message';
+    type: 'friend_request' | 'message' | 'group_invite';
     title: string;
     body: string;
     link: string;
@@ -15,6 +17,10 @@ const notifBell       = document.getElementById('notifBell')       as HTMLButton
 const notifBadge      = document.getElementById('notifBadge')      as HTMLSpanElement   | null;
 const notifList       = document.getElementById('notifList')       as HTMLUListElement  | null;
 const notifMarkAllRead = document.getElementById('notifMarkAllRead') as HTMLButtonElement | null;
+const notifDismissAll = document.getElementById('notifDismissAll') as HTMLButtonElement | null;
+const browserNotifToggle = document.getElementById('browserNotifToggle') as HTMLInputElement | null;
+
+const BROWSER_NOTIF_SETTING_KEY = 'kq-browser-notifications-enabled';
 
 if (!notifBell || !notifBadge || !notifList) {
     // Not logged in — nothing to do
@@ -23,6 +29,20 @@ if (!notifBell || !notifBadge || !notifList) {
 
 // ── In-memory store ───────────────────────────────────────────────────────────
 let notifications: AppNotification[] = [];
+
+function browserNotificationsEnabled(): boolean {
+    return localStorage.getItem(BROWSER_NOTIF_SETTING_KEY) === 'true';
+}
+
+function setBrowserNotificationsEnabled(enabled: boolean) {
+    localStorage.setItem(BROWSER_NOTIF_SETTING_KEY, enabled ? 'true' : 'false');
+}
+
+function emitNotificationsUpdate() {
+    window.dispatchEvent(new CustomEvent('kq:notifications:update', {
+        detail: { notifications: [...notifications] },
+    }));
+}
 
 function unreadCount(): number {
     return notifications.filter(n => !n.read).length;
@@ -38,6 +58,45 @@ function updateBadge() {
     }
 }
 
+function parseNotificationLink(link: string): { openId: string | null; type: 'dm' | 'group' | null } {
+    try {
+        const url = new URL(link, window.location.origin);
+        return {
+            openId: url.searchParams.get('open'),
+            type: (url.searchParams.get('type') as 'dm' | 'group' | null) ?? null,
+        };
+    } catch {
+        return { openId: null, type: null };
+    }
+}
+
+function shouldSuppressInAppNotification(notif: AppNotification): boolean {
+    if (!window.location.pathname.startsWith('/chat')) return false;
+    const { openId, type } = parseNotificationLink(notif.link);
+    if (!openId || (type !== 'dm' && type !== 'group')) return false;
+
+    const current = new URLSearchParams(window.location.search);
+    return current.get('open') === openId && current.get('type') === type;
+}
+
+function maybeShowBrowserNotification(notif: AppNotification) {
+    if (!browserNotificationsEnabled()) return;
+    if (!('Notification' in window)) return;
+    if (Notification.permission !== 'granted') return;
+    if (shouldSuppressInAppNotification(notif)) return;
+
+    const n = new Notification(notif.title, {
+        body: notif.body || 'Open to view details.',
+        tag: `kq-${notif.id}`,
+    });
+
+    n.onclick = () => {
+        if (notif.link) window.location.href = notif.link;
+        window.focus();
+        n.close();
+    };
+}
+
 // ── Render list ───────────────────────────────────────────────────────────────
 function renderList() {
     if (notifications.length === 0) {
@@ -50,7 +109,7 @@ function renderList() {
         li.className = `flex flex-col gap-1 px-4 py-3 border-b border-base-300/50 ${n.read ? 'opacity-60' : 'bg-base-200/50'}`;
         li.dataset.id = n.id;
 
-        const icon = n.type === 'friend_request' ? '👤' : '💬';
+        const icon = n.type === 'friend_request' ? '👤' : n.type === 'group_invite' ? '👥' : '💬';
         const date = new Date(n.createdAt).toLocaleString(undefined, {
             month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
         });
@@ -98,7 +157,42 @@ notifMarkAllRead?.addEventListener('click', async () => {
         notifications.forEach(n => { n.read = true; });
         updateBadge();
         renderList();
+        emitNotificationsUpdate();
     } catch { /* silent */ }
+});
+
+notifDismissAll?.addEventListener('click', async () => {
+    try {
+        await fetch('/notifications', { method: 'DELETE' });
+        notifications = [];
+        updateBadge();
+        renderList();
+        emitNotificationsUpdate();
+    } catch { /* silent */ }
+});
+
+browserNotifToggle?.addEventListener('change', async () => {
+    const enabled = browserNotifToggle.checked;
+    if (!enabled) {
+        setBrowserNotificationsEnabled(false);
+        return;
+    }
+
+    if (!('Notification' in window)) {
+        browserNotifToggle.checked = false;
+        setBrowserNotificationsEnabled(false);
+        return;
+    }
+
+    if (Notification.permission === 'granted') {
+        setBrowserNotificationsEnabled(true);
+        return;
+    }
+
+    const permission = await Notification.requestPermission();
+    const allowed = permission === 'granted';
+    browserNotifToggle.checked = allowed;
+    setBrowserNotificationsEnabled(allowed);
 });
 
 async function markRead(id: string) {
@@ -108,6 +202,7 @@ async function markRead(id: string) {
         if (n) n.read = true;
         updateBadge();
         renderList();
+        emitNotificationsUpdate();
     } catch { /* silent */ }
 }
 
@@ -117,6 +212,7 @@ async function dismiss(id: string) {
         notifications = notifications.filter(n => n.id !== id);
         updateBadge();
         renderList();
+        emitNotificationsUpdate();
     } catch { /* silent */ }
 }
 
@@ -137,11 +233,20 @@ async function fetchNotifications() {
             }));
             updateBadge();
             renderList();
+            emitNotificationsUpdate();
         }
     } catch { /* silent */ }
 }
 
 fetchNotifications();
+
+window.addEventListener('kq:notifications:refresh', () => {
+    void fetchNotifications();
+});
+
+if (browserNotifToggle) {
+    browserNotifToggle.checked = browserNotificationsEnabled();
+}
 
 // Load list when bell dropdown opens
 notifBell.addEventListener('click', () => {
@@ -175,10 +280,17 @@ function connectNotifWs() {
                 read: n.read,
                 createdAt: n.createdAt,
             };
+
+            if (shouldSuppressInAppNotification(notif)) {
+                return;
+            }
+
             // Prepend so newest is at top
             notifications.unshift(notif);
             updateBadge();
             renderList();
+            emitNotificationsUpdate();
+            maybeShowBrowserNotification(notif);
         }
     };
 

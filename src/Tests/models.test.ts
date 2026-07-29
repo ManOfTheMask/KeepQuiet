@@ -84,10 +84,11 @@ describe('ConversationModel', () => {
     expect(conv.participants).toHaveLength(2);
   });
 
-  it('defaults pinnedBy and hiddenBy to empty arrays', async () => {
+  it('defaults pinnedBy, hiddenBy, and mutedBy to empty arrays', async () => {
     const conv = await ConversationModel.create({ participants: [idA, idB] });
     expect(conv.pinnedBy).toEqual([]);
     expect(conv.hiddenBy).toEqual([]);
+    expect(conv.mutedBy).toEqual([]);
   });
 
   it('defaults lastMessageAt to null', async () => {

@@ -1,4 +1,4 @@
-<div class="flex flex-1 min-h-0 overflow-hidden">
+<div id="chatApp" class="flex flex-1 min-h-0 overflow-hidden">
 
     <script>
         window.__CHAT_CALL_CONFIG__ = {
@@ -58,11 +58,15 @@
                     data-id="{{this.id}}"
                     data-type="{{this.type}}"
                     data-admin-id="{{this.adminId}}"
-                    data-pinned="{{this.pinned}}">
+                    data-pinned="{{this.pinned}}"
+                    data-muted="{{this.muted}}">
                     <div class="flex-1 min-w-0">
                         <div class="flex items-center gap-1">
                             {{#if this.pinned}}
-                            <span class="text-warning text-xs" title="Pinned">📌</span>
+                            <span class="pin-icon text-warning text-xs" title="Pinned">📌</span>
+                            {{/if}}
+                            {{#if this.muted}}
+                            <span class="mute-icon text-base-content/50 text-xs" title="Muted">🔕</span>
                             {{/if}}
                             {{#if (eq this.type "group")}}
                             <span class="text-xs" title="Group chat">👥</span>
@@ -75,6 +79,9 @@
                     </div>
                     <button class="pin-btn btn btn-ghost btn-xs opacity-0 group-hover:opacity-100 shrink-0" title="{{#if this.pinned}}Unpin{{else}}Pin{{/if}}">
                         {{#if this.pinned}}Unpin{{else}}Pin{{/if}}
+                    </button>
+                    <button class="mute-btn btn btn-ghost btn-xs opacity-0 group-hover:opacity-100 shrink-0" title="{{#if this.muted}}Unmute{{else}}Mute{{/if}}">
+                        {{#if this.muted}}Unmute{{else}}Mute{{/if}}
                     </button>
                 </li>
                 {{/each}}
@@ -118,7 +125,7 @@
                     <button id="callCloseBtn" class="btn btn-ghost btn-xs sm:btn-sm">✕</button>
                 </div>
 
-                <div class="flex flex-1 min-h-0 overflow-hidden">
+                <div class="flex flex-col sm:flex-row flex-1 min-h-0 overflow-hidden">
                     <div class="flex-1 bg-base-300 p-2 sm:p-3 overflow-auto min-h-0">
                         <div id="callVideoGrid" class="grid gap-2 sm:gap-3" style="grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); align-content: start;">
                             <div id="callTileLocal" class="relative bg-base-200 rounded-lg overflow-hidden aspect-video border border-base-300">
@@ -128,15 +135,16 @@
                         </div>
                     </div>
 
-                    <aside class="w-56 sm:w-64 border-l border-base-300 bg-base-100 p-2 sm:p-3 flex flex-col gap-2 min-h-0">
-                        <h4 class="font-semibold text-xs sm:text-sm">Participants</h4>
-                        <p id="callParticipantCount" class="text-xs text-base-content/60">1 in call</p>
-                        <ul id="callParticipantList" class="flex-1 overflow-y-auto text-xs sm:text-sm flex flex-col gap-1"></ul>
+                    <details class="w-full sm:w-64 border-t sm:border-t-0 sm:border-l border-base-300 bg-base-100 p-2 sm:p-3 flex flex-col gap-2 min-h-0" open>
+                        <summary class="sm:hidden cursor-pointer text-sm font-semibold">Participants</summary>
+                        <h4 class="hidden sm:block font-semibold text-xs sm:text-sm">Participants</h4>
+                        <p id="callParticipantCount" class="text-xs text-base-content/60 mt-1 sm:mt-0">1 in call</p>
+                        <ul id="callParticipantList" class="max-h-32 sm:max-h-none sm:flex-1 overflow-y-auto text-xs sm:text-sm flex flex-col gap-1"></ul>
                         <p class="text-xs text-base-content/50">WebRTC media is encrypted end-to-end between peers.</p>
-                    </aside>
+                    </details>
                 </div>
 
-                <div class="h-14 sm:h-16 px-3 sm:px-4 border-t border-base-300 flex items-center justify-center gap-2 sm:gap-3 shrink-0">
+                <div id="callPanelControls" class="h-14 sm:h-16 px-3 sm:px-4 border-t border-base-300 flex items-center justify-center gap-2 sm:gap-3 shrink-0">
                     <button id="callMuteBtn" class="btn btn-outline btn-xs sm:btn-sm">🎙️ Mute</button>
                     <button id="callCamBtn" class="btn btn-outline btn-xs sm:btn-sm">📹 Enable Cam</button>
                     <button id="callShareBtn" class="btn btn-outline btn-xs sm:btn-sm">🖥️ Share Screen</button>
@@ -147,8 +155,8 @@
             <div id="callResizeHandle" class="hidden h-2 cursor-row-resize bg-base-200 hover:bg-base-300 border-y border-base-300"></div>
 
             <!-- Messages -->
-            <div id="messagesPane" class="flex-1 min-h-0 flex flex-col">
-                <div id="messagesContainer" class="flex-1 overflow-y-auto p-4 sm:p-6 flex flex-col gap-3 bg-base-300">
+            <div id="messagesPane" class="flex-1 min-h-0 flex flex-col overflow-hidden">
+                <div id="messagesContainer" class="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 flex flex-col gap-3 bg-base-300">
                     <div id="messagesPlaceholder" class="m-auto text-base-content/30 text-sm select-none">
                         Open a conversation to start chatting
                     </div>
@@ -277,6 +285,8 @@
 
 <script>
 (function() {
+    document.body.classList.add('chat-page');
+
     var sidebar = document.getElementById('sidebar');
     var backdrop = document.getElementById('sidebarBackdrop');
     var mobileQuery = window.matchMedia('(max-width: 639px)');

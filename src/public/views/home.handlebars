@@ -86,17 +86,21 @@
         </div>
 
         {{!-- Recent notifications --}}
-        <div class="bg-base-200 rounded-xl shadow p-4 md:col-span-2">
-            <div class="flex items-center justify-between mb-3">
+        <div id="recent-notifications-card" class="bg-base-200 rounded-xl shadow p-4 md:col-span-2">
+            <div id="recent-notifications-header" class="flex items-center justify-between mb-3">
                 <h2 class="text-base-content font-semibold text-xs uppercase tracking-wider opacity-60">Recent Notifications</h2>
                 {{#if hasNotifs}}
-                <button id="mark-all-read-btn" class="btn btn-ghost btn-xs text-xs">Mark all read</button>
+                <div class="flex items-center gap-1">
+                    <button id="mark-all-read-btn" class="btn btn-ghost btn-xs text-xs">Mark all read</button>
+                    <button id="dismiss-all-notifs-btn" class="btn btn-ghost btn-xs text-xs text-error">Dismiss all</button>
+                </div>
                 {{/if}}
             </div>
+            <div id="recent-notifications-body">
             {{#if hasNotifs}}
                 <ul class="flex flex-col gap-1.5 max-h-56 overflow-y-auto" id="notif-list">
                     {{#each recentNotifs}}
-                    <li class="flex items-center gap-2.5 bg-base-100 rounded-lg px-2.5 py-2 {{#unless read}}border-l-2 border-primary{{/unless}}" data-notif-id="{{id}}">
+                    <li class="flex items-center gap-2.5 bg-base-100 rounded-lg px-2.5 py-2 {{#if read}}opacity-60{{else}}border-l-2 border-primary{{/if}}" data-notif-id="{{id}}">
                         <div class="flex-1 min-w-0">
                             <p class="text-sm font-medium text-base-content truncate leading-tight">{{title}}</p>
                             {{#if body}}<p class="text-xs text-base-content/50 truncate">{{body}}</p>{{/if}}
@@ -104,8 +108,9 @@
                         <div class="flex items-center gap-1.5 shrink-0">
                             <span class="text-xs text-base-content/30 hidden sm:inline">{{createdAt}}</span>
                             {{#if link}}
-                            <a href="{{link}}" class="btn btn-xs btn-ghost text-xs">View</a>
+                            <a href="{{link}}" class="btn btn-xs btn-ghost text-xs" data-notif-action="view" data-notif-id="{{id}}">View</a>
                             {{/if}}
+                            <button class="btn btn-xs btn-ghost text-error" data-notif-action="dismiss" data-notif-id="{{id}}">Dismiss</button>
                         </div>
                     </li>
                     {{/each}}
@@ -113,6 +118,7 @@
             {{else}}
                 <p class="text-sm text-base-content/30 py-5 text-center">All caught up</p>
             {{/if}}
+            </div>
         </div>
 
         </div>

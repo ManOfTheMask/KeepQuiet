@@ -30,6 +30,7 @@ class ChatController {
             .map((c: any) => ({
                 ...c,
                 pinned: c.pinnedBy.some((p: any) => p.equals(uid)),
+                muted: (c.mutedBy ?? []).some((p: any) => p.equals(uid)),
                 other: c.participants.find((p: any) => !p._id.equals(uid)),
             }))
             .sort((a: any, b: any) => {
@@ -159,6 +160,27 @@ class ChatController {
         } else {
             await ConversationModel.findByIdAndUpdate(cid, { $addToSet: { pinnedBy: uid } });
             return { pinned: true };
+        }
+    }
+
+    /** Toggle mute for the calling user on a conversation. */
+    async toggleMute(conversationId: string, userId: string) {
+        const cid = new mongoose.Types.ObjectId(conversationId);
+        const uid = new mongoose.Types.ObjectId(userId);
+
+        const conv = await ConversationModel.findById(cid);
+        if (!conv) throw new Error("Conversation not found.");
+        if (!(conv.participants as any[]).some((p: any) => p.equals(uid))) {
+            throw new Error("Unauthorized.");
+        }
+
+        const isMuted = (conv.mutedBy as any[]).some((p: any) => p.equals(uid));
+        if (isMuted) {
+            await ConversationModel.findByIdAndUpdate(cid, { $pull: { mutedBy: uid } });
+            return { muted: false };
+        } else {
+            await ConversationModel.findByIdAndUpdate(cid, { $addToSet: { mutedBy: uid } });
+            return { muted: true };
         }
     }
 }

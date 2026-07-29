@@ -30,6 +30,11 @@ const groupConversationSchema = new mongoose.Schema({
         default: [],
     },
 
+    mutedBy: {
+        type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+        default: [],
+    },
+
     lastMessageAt: {
         type: Date,
         default: null,

@@ -9,6 +9,43 @@
     --navbar-height: 4rem;
 }
 
+/* Chat page should not scroll at the document level.
+   The messages pane handles vertical scrolling instead. */
+body.chat-page {
+    overflow: hidden;
+    height: 100dvh;
+}
+
+body.chat-page main {
+    overflow: hidden;
+    min-height: 0;
+}
+
+/* Keep chat focused on viewport space instead of pushing input below fold. */
+body.chat-page footer {
+    display: none;
+}
+
+#chatApp {
+    height: 100%;
+}
+
+#messagesPane {
+    min-height: 0;
+    overflow: hidden;
+}
+
+#messagesContainer {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+#inputBar {
+    position: sticky;
+    bottom: 0;
+    z-index: 10;
+}
+
 @media (max-width: 639px) {
     #sidebar {
         position: fixed;
@@ -32,5 +69,25 @@
     }
     #sidebarBackdrop.sidebar-open {
         display: block;
+    }
+
+    /* Group members panel becomes a slide-over on mobile to avoid squeezing chat area. */
+    #groupMembersPanel {
+        position: fixed;
+        top: var(--navbar-height);
+        right: 0;
+        bottom: 0;
+        width: min(22rem, 90vw);
+        z-index: 45;
+        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
+    }
+
+    /* Let call controls wrap on small screens so they don't overflow viewport width. */
+    #callPanelControls {
+        height: auto;
+        min-height: 3.5rem;
+        padding-top: 0.5rem;
+        padding-bottom: 0.5rem;
+        flex-wrap: wrap;
     }
 }
