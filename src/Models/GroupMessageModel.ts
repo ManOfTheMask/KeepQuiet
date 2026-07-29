@@ -37,6 +37,15 @@ const groupMessageSchema = new mongoose.Schema({
         ],
         default: [],
     },
+    reactions: {
+        type: [
+            {
+                emoji: { type: String, required: true },
+                users: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+            },
+        ],
+        default: [],
+    },
 });
 
 const GroupMessageModel = mongoose.model("GroupMessage", groupMessageSchema);

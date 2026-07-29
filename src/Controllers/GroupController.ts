@@ -341,6 +341,50 @@ class GroupController {
             return { muted: true };
         }
     }
+
+    /** Toggle a reaction on a group message for the calling user. */
+    async toggleReaction(groupId: string, messageId: string, userId: string, emoji: string) {
+        const cleanEmoji = emoji?.trim();
+        if (!cleanEmoji) throw new Error("emoji is required.");
+
+        const gid = new mongoose.Types.ObjectId(groupId);
+        const uid = new mongoose.Types.ObjectId(userId);
+
+        const group = await GroupConversationModel.findById(gid);
+        if (!group) throw new Error("Group not found.");
+
+        const isMember = (group.members as any[]).some((m: any) => m.userId.equals(uid));
+        if (!isMember) throw new Error("Unauthorized.");
+
+        const msg = await GroupMessageModel.findOne({ _id: new mongoose.Types.ObjectId(messageId), groupId: gid });
+        if (!msg) throw new Error("Message not found.");
+        if (msg.deletedAt) throw new Error("Cannot react to a deleted message.");
+
+        const reactions = (msg.reactions as any[]) ?? [];
+        const existing = reactions.find((r: any) => r.emoji === cleanEmoji);
+
+        if (!existing) {
+            reactions.push({ emoji: cleanEmoji, users: [uid] });
+        } else {
+            const alreadyReacted = (existing.users as any[]).some((id: any) => id.equals(uid));
+            if (alreadyReacted) {
+                existing.users = (existing.users as any[]).filter((id: any) => !id.equals(uid));
+            } else {
+                existing.users.push(uid);
+            }
+        }
+
+        msg.reactions = reactions.filter((r: any) => (r.users ?? []).length > 0) as any;
+        await msg.save();
+
+        return {
+            messageId: msg._id.toString(),
+            reactions: (msg.reactions as any[]).map((r: any) => ({
+                emoji: r.emoji,
+                users: (r.users ?? []).map((id: any) => id.toString()),
+            })),
+        };
+    }
 }
 
 export default new GroupController();
