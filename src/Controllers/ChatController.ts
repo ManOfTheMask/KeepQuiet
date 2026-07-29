@@ -183,6 +183,50 @@ class ChatController {
             return { muted: true };
         }
     }
+
+    /** Toggle a reaction on a DM message for the calling user. */
+    async toggleReaction(conversationId: string, messageId: string, userId: string, emoji: string) {
+        const cleanEmoji = emoji?.trim();
+        if (!cleanEmoji) throw new Error("emoji is required.");
+
+        const cid = new mongoose.Types.ObjectId(conversationId);
+        const uid = new mongoose.Types.ObjectId(userId);
+
+        const conv = await ConversationModel.findById(cid);
+        if (!conv) throw new Error("Conversation not found.");
+        if (!(conv.participants as any[]).some((p: any) => p.equals(uid))) {
+            throw new Error("Unauthorized.");
+        }
+
+        const msg = await MessageModel.findOne({ _id: new mongoose.Types.ObjectId(messageId), conversationId: cid });
+        if (!msg) throw new Error("Message not found.");
+        if (msg.deletedAt) throw new Error("Cannot react to a deleted message.");
+
+        const reactions = (msg.reactions as any[]) ?? [];
+        const existing = reactions.find((r: any) => r.emoji === cleanEmoji);
+
+        if (!existing) {
+            reactions.push({ emoji: cleanEmoji, users: [uid] });
+        } else {
+            const alreadyReacted = (existing.users as any[]).some((id: any) => id.equals(uid));
+            if (alreadyReacted) {
+                existing.users = (existing.users as any[]).filter((id: any) => !id.equals(uid));
+            } else {
+                existing.users.push(uid);
+            }
+        }
+
+        msg.reactions = reactions.filter((r: any) => (r.users ?? []).length > 0) as any;
+        await msg.save();
+
+        return {
+            messageId: msg._id.toString(),
+            reactions: (msg.reactions as any[]).map((r: any) => ({
+                emoji: r.emoji,
+                users: (r.users ?? []).map((id: any) => id.toString()),
+            })),
+        };
+    }
 }
 
 export default new ChatController();

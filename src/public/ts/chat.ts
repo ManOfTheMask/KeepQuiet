@@ -47,6 +47,19 @@ const currentUserId: string | null =
 // Track rendered message IDs to deduplicate WebSocket pushes
 const renderedMessageIds = new Set<string>();
 
+type MessageReaction = { emoji: string; users: string[] };
+
+const REACTION_EMOJIS = [
+    '😀', '😂', '😍', '🥳', '😎', '🤯', '😭', '😡',
+    '👍', '👎', '👏', '🙏', '💯', '🔥', '❤️', '💔',
+    '🎉', '✨', '👀', '🤝', '🤔', '🙌', '🥶', '😴',
+    '😅', '😬', '🤖', '🍕', '☕', '🐱', '🌈', '🚀',
+];
+
+let activeReactionPicker: HTMLDivElement | null = null;
+let activeReactionAnchor: HTMLElement | null = null;
+let activeReactionMessageId: string | null = null;
+
 // PGP credentials — loaded from sessionStorage (populated on login or via unlock overlay)
 // Read as functions so they always reflect the latest value after an in-page unlock
 function pgpPrivateKey(): string | null { return sessionStorage.getItem('pgpPrivateKey'); }
@@ -216,9 +229,13 @@ function connectChatWs() {
             if (data.conversationId === activeConversationId) {
                 const el = messagesContainer.querySelector<HTMLElement>(`[data-message-id="${data.messageId}"]`);
                 if (el) {
-                    const bubble = el.querySelector('div')!;
+                    const bubble = el.querySelector<HTMLElement>('[data-role="message-bubble"]');
+                    if (!bubble) return;
                     bubble.className = 'relative max-w-sm px-4 py-2 rounded-2xl text-sm shadow bg-base-200 text-base-content/40 italic';
+                    bubble.dataset.messageDeleted = 'true';
                     bubble.innerHTML = '<span class="block text-xs font-semibold mb-1 opacity-70">Deleted</span><span>This message was deleted.</span>';
+                    el.querySelector('[data-role="reaction-row"]')?.remove();
+                    if (activeReactionMessageId === data.messageId) closeReactionPicker();
                 }
             }
         }
@@ -239,10 +256,26 @@ function connectChatWs() {
             if (data.groupId === activeConversationId) {
                 const el = messagesContainer.querySelector<HTMLElement>(`[data-message-id="${data.messageId}"]`);
                 if (el) {
-                    const bubble = el.querySelector('div')!;
+                    const bubble = el.querySelector<HTMLElement>('[data-role="message-bubble"]');
+                    if (!bubble) return;
                     bubble.className = 'relative max-w-sm px-4 py-2 rounded-2xl text-sm shadow bg-base-200 text-base-content/40 italic';
+                    bubble.dataset.messageDeleted = 'true';
                     bubble.innerHTML = '<span class="block text-xs font-semibold mb-1 opacity-70">Deleted</span><span>This message was deleted.</span>';
+                    el.querySelector('[data-role="reaction-row"]')?.remove();
+                    if (activeReactionMessageId === data.messageId) closeReactionPicker();
                 }
+            }
+        }
+
+        if (data.type === 'message_reaction_updated') {
+            if (data.conversationId === activeConversationId && activeConversationType === 'dm') {
+                setMessageReactions(data.messageId, data.reactions ?? []);
+            }
+        }
+
+        if (data.type === 'group_message_reaction_updated') {
+            if (data.groupId === activeConversationId && activeConversationType === 'group') {
+                setMessageReactions(data.messageId, data.reactions ?? []);
             }
         }
 
@@ -384,6 +417,199 @@ function scrollMessagesToBottom() {
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
 
+function normalizeReactions(input: any): MessageReaction[] {
+    if (!Array.isArray(input)) return [];
+    const normalized: MessageReaction[] = [];
+
+    for (const reaction of input) {
+        const emoji = typeof reaction?.emoji === 'string' ? reaction.emoji.trim() : '';
+        if (!emoji) continue;
+
+        const users: string[] = [];
+        if (Array.isArray(reaction?.users)) {
+            const seen = new Set<string>();
+            for (const rawUser of reaction.users) {
+                const normalizedUser = String(rawUser).trim();
+                if (!normalizedUser || seen.has(normalizedUser)) continue;
+                seen.add(normalizedUser);
+                users.push(normalizedUser);
+            }
+        }
+
+        if (users.length === 0) continue;
+        normalized.push({ emoji, users });
+    }
+
+    return normalized.sort((a, b) => b.users.length - a.users.length);
+}
+
+function closeReactionPicker() {
+    activeReactionPicker?.remove();
+    activeReactionPicker = null;
+    activeReactionAnchor = null;
+    activeReactionMessageId = null;
+}
+
+function positionReactionPicker() {
+    if (!activeReactionPicker || !activeReactionAnchor) return;
+
+    const anchorRect = activeReactionAnchor.getBoundingClientRect();
+    const picker = activeReactionPicker;
+    const margin = 8;
+
+    const width = picker.offsetWidth || 224;
+    const height = picker.offsetHeight || 180;
+
+    let left = anchorRect.left;
+    let top = anchorRect.bottom + margin;
+
+    if (left + width > window.innerWidth - margin) {
+        left = window.innerWidth - width - margin;
+    }
+    if (left < margin) left = margin;
+
+    if (top + height > window.innerHeight - margin) {
+        top = anchorRect.top - height - margin;
+    }
+    if (top < margin) top = margin;
+
+    picker.style.left = `${left}px`;
+    picker.style.top = `${top}px`;
+}
+
+function openReactionPicker(anchor: HTMLElement, messageId: string) {
+    if (activeReactionPicker && activeReactionMessageId === messageId) {
+        closeReactionPicker();
+        return;
+    }
+    closeReactionPicker();
+
+    const picker = document.createElement('div');
+    picker.className = 'fixed z-50 w-56 max-h-44 overflow-y-auto rounded-xl border border-base-300 bg-base-100 p-2 shadow-2xl';
+    picker.setAttribute('role', 'dialog');
+    picker.setAttribute('aria-label', 'Emoji reactions');
+
+    const grid = document.createElement('div');
+    grid.className = 'grid grid-cols-4 gap-1';
+
+    for (const emoji of REACTION_EMOJIS) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm h-9 min-h-0 rounded-lg px-0';
+        btn.textContent = emoji;
+        btn.title = `React with ${emoji}`;
+        btn.onclick = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            closeReactionPicker();
+            void toggleMessageReaction(messageId, emoji);
+        };
+        grid.appendChild(btn);
+    }
+
+    picker.appendChild(grid);
+    document.body.appendChild(picker);
+
+    activeReactionPicker = picker;
+    activeReactionAnchor = anchor;
+    activeReactionMessageId = messageId;
+    positionReactionPicker();
+}
+
+function renderReactionRow(messageEl: HTMLElement, reactions: MessageReaction[]) {
+    const bubble = messageEl.querySelector<HTMLElement>('[data-role="message-bubble"]');
+    if (!bubble || bubble.dataset.messageDeleted === 'true') {
+        messageEl.querySelector('[data-role="reaction-row"]')?.remove();
+        return;
+    }
+
+    const messageId = messageEl.dataset.messageId;
+    if (!messageId) return;
+
+    const isMine = currentUserId && messageEl.dataset.senderId === currentUserId;
+
+    let row = messageEl.querySelector<HTMLElement>('[data-role="reaction-row"]');
+    if (!row) {
+        row = document.createElement('div');
+        row.dataset.role = 'reaction-row';
+        row.className = `mt-1 flex flex-wrap items-center gap-1 px-1 ${isMine ? 'justify-end' : 'justify-start'}`;
+        const timeEl = messageEl.querySelector<HTMLElement>('[data-role="message-time"]');
+        if (timeEl) {
+            messageEl.insertBefore(row, timeEl);
+        } else {
+            messageEl.appendChild(row);
+        }
+    }
+
+    row.innerHTML = '';
+
+    for (const reaction of reactions) {
+        const reactedByMe = !!currentUserId && reaction.users.includes(currentUserId);
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = reactedByMe
+            ? 'btn btn-xs h-7 min-h-0 rounded-full border-primary bg-primary/15 px-2 text-primary'
+            : 'btn btn-xs h-7 min-h-0 rounded-full border-base-300 bg-base-100 px-2';
+        chip.textContent = `${reaction.emoji} ${reaction.users.length}`;
+        chip.title = `Toggle ${reaction.emoji}`;
+        chip.onclick = () => void toggleMessageReaction(messageId, reaction.emoji);
+        row.appendChild(chip);
+    }
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.dataset.role = 'reaction-add-btn';
+    addBtn.className = 'btn btn-xs h-7 min-h-0 rounded-full border-base-300 bg-base-100 px-2';
+    addBtn.textContent = '🙂+';
+    addBtn.title = 'Add reaction';
+    addBtn.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openReactionPicker(addBtn, messageId);
+    };
+    row.appendChild(addBtn);
+}
+
+function setMessageReactions(messageId: string, reactionsInput: any) {
+    const messageEl = messagesContainer.querySelector<HTMLElement>(`[data-message-id="${messageId}"]`);
+    if (!messageEl) return;
+    renderReactionRow(messageEl, normalizeReactions(reactionsInput));
+}
+
+async function toggleMessageReaction(messageId: string, emoji: string) {
+    if (!activeConversationId) return;
+
+    const url = activeConversationType === 'group'
+        ? `/group/${activeConversationId}/messages/${messageId}/reactions`
+        : `/chat/${activeConversationId}/messages/${messageId}/reactions`;
+
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ emoji }),
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.message);
+        setMessageReactions(messageId, data.reactions ?? []);
+    } catch (err: any) {
+        alert(err.message);
+    }
+}
+
+document.addEventListener('click', (event) => {
+    if (!activeReactionPicker) return;
+    const target = event.target as Node | null;
+    if (!target) return;
+    if (activeReactionPicker.contains(target)) return;
+    if (activeReactionAnchor?.contains(target)) return;
+    closeReactionPicker();
+}, true);
+
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeReactionPicker();
+});
+
 let isResizingCallPanel = false;
 
 function showCallPanel() {
@@ -428,6 +654,7 @@ window.addEventListener('mouseup', () => {
 });
 
 window.addEventListener('resize', () => {
+    if (activeReactionPicker) positionReactionPicker();
     if (callPanel.classList.contains('hidden')) return;
     if (!callPanel.style.height) return;
     setCallPanelHeight(parseFloat(callPanel.style.height));
@@ -1081,6 +1308,7 @@ async function buildMessageEl(msg: {
     createdAt: string;
     createdAtMs?: number;
     readBy?: { userId: string; username: string; readAt: string | null }[];
+    reactions?: MessageReaction[];
 }) {
     const isMine = currentUserId && msg.senderId === currentUserId;
 
@@ -1122,6 +1350,8 @@ async function buildMessageEl(msg: {
     avatar.src = avatarUrl ?? '/img/profileplaceholder.jpg';
 
     const bubble = document.createElement('div');
+    bubble.dataset.role = 'message-bubble';
+    bubble.dataset.messageDeleted = msg.deleted ? 'true' : 'false';
     bubble.className = `relative max-w-sm px-4 py-2 rounded-2xl text-sm shadow
         ${msg.deleted ? 'bg-base-200 text-base-content/40 italic' : isMine ? 'bg-primary text-primary-content' : 'bg-base-100 text-base-content'}`;
 
@@ -1146,9 +1376,13 @@ async function buildMessageEl(msg: {
 
     const time = document.createElement('span');
     time.className = 'text-xs text-base-content/30 mt-1 px-1';
+    time.dataset.role = 'message-time';
     time.textContent = msg.createdAt;
 
     li.appendChild(row);
+    if (!msg.deleted) {
+        renderReactionRow(li, normalizeReactions(msg.reactions ?? []));
+    }
     li.appendChild(time);
 
     // Read receipt indicator (own non-deleted messages only)
@@ -1232,9 +1466,13 @@ async function deleteMessage(messageId: string, el: HTMLElement) {
         const data = await res.json();
         if (!data.success) throw new Error(data.message);
         // Re-render the bubble as deleted in place
-        const bubble = el.querySelector('div')!;
+        const bubble = el.querySelector<HTMLElement>('[data-role="message-bubble"]');
+        if (!bubble) return;
         bubble.className = 'relative max-w-sm px-4 py-2 rounded-2xl text-sm shadow bg-base-200 text-base-content/40 italic';
+        bubble.dataset.messageDeleted = 'true';
         bubble.innerHTML = `<span class="block text-xs font-semibold mb-1 opacity-70">You</span><span>This message was deleted.</span>`;
+        el.querySelector('[data-role="reaction-row"]')?.remove();
+        if (activeReactionMessageId === messageId) closeReactionPicker();
     } catch (err: any) {
         alert(err.message);
     }

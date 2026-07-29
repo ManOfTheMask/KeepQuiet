@@ -1059,6 +1059,10 @@ app.get('/chat/:conversationId/messages', requireAuth, async (req: Request, res:
                 username: r.userId?.username ?? 'Unknown',
                 readAt: r.readAt ? new Date(r.readAt).toISOString() : null,
             })),
+            reactions: (m.reactions ?? []).map((r: any) => ({
+                emoji: r.emoji,
+                users: (r.users ?? []).map((uid: any) => uid.toString()),
+            })),
         }));
         res.json({ success: true, messages: serialized });
     } catch (error: any) {
@@ -1122,6 +1126,7 @@ app.post('/chat/:conversationId/messages', requireAuth, async (req: Request, res
                     createdAt: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                     createdAtMs: new Date(message.createdAt).getTime(),
                     readBy: [],
+                    reactions: [],
                 },
             };
             for (const participantId of conv.participants as any[]) {
@@ -1186,6 +1191,41 @@ app.delete('/chat/:conversationId/messages/:messageId', requireAuth, async (req:
         }
 
         res.json({ success: true });
+    } catch (error: any) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+// Toggle reaction on a DM message
+app.post('/chat/:conversationId/messages/:messageId/reactions', requireAuth, async (req: Request, res: Response) => {
+    const { emoji } = req.body;
+    if (!emoji || typeof emoji !== 'string') {
+        res.status(400).json({ success: false, message: 'emoji is required.' });
+        return;
+    }
+
+    try {
+        const result = await ChatController.toggleReaction(
+            req.params.conversationId,
+            req.params.messageId,
+            req.session.userId!,
+            emoji,
+        );
+
+        const conv = await ConversationModel.findById(req.params.conversationId).lean();
+        if (conv) {
+            const wsMsg = {
+                type: 'message_reaction_updated',
+                conversationId: req.params.conversationId,
+                messageId: req.params.messageId,
+                reactions: result.reactions,
+            };
+            for (const participantId of conv.participants as any[]) {
+                broadcastToUser(participantId.toString(), wsMsg);
+            }
+        }
+
+        res.json({ success: true, ...result });
     } catch (error: any) {
         res.status(400).json({ success: false, message: error.message });
     }
@@ -1524,6 +1564,10 @@ app.get('/group/:groupId/messages', requireAuth, async (req: Request, res: Respo
                 username: r.userId?.username ?? 'Unknown',
                 readAt: r.readAt ? new Date(r.readAt).toISOString() : null,
             })),
+            reactions: (m.reactions ?? []).map((r: any) => ({
+                emoji: r.emoji,
+                users: (r.users ?? []).map((uid: any) => uid.toString()),
+            })),
         }));
         res.json({ success: true, messages: serialized });
     } catch (err: any) {
@@ -1582,6 +1626,7 @@ app.post('/group/:groupId/messages', requireAuth, async (req: Request, res: Resp
                     createdAt: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                     createdAtMs: new Date(message.createdAt).getTime(),
                     readBy: [],
+                    reactions: [],
                 },
             };
             for (const m of group.members as any[]) {
@@ -1645,6 +1690,41 @@ app.delete('/group/:groupId/messages/:messageId', requireAuth, async (req: Reque
         res.json({ success: true });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
+    }
+});
+
+// Toggle reaction on a group message
+app.post('/group/:groupId/messages/:messageId/reactions', requireAuth, async (req: Request, res: Response) => {
+    const { emoji } = req.body;
+    if (!emoji || typeof emoji !== 'string') {
+        res.status(400).json({ success: false, message: 'emoji is required.' });
+        return;
+    }
+
+    try {
+        const result = await GroupController.toggleReaction(
+            req.params.groupId,
+            req.params.messageId,
+            req.session.userId!,
+            emoji,
+        );
+
+        const group = await GroupConversationModel.findById(req.params.groupId).lean();
+        if (group) {
+            const wsMsg = {
+                type: 'group_message_reaction_updated',
+                groupId: req.params.groupId,
+                messageId: req.params.messageId,
+                reactions: result.reactions,
+            };
+            for (const m of group.members as any[]) {
+                broadcastToUser(m.userId.toString(), wsMsg);
+            }
+        }
+
+        res.json({ success: true, ...result });
+    } catch (error: any) {
+        res.status(400).json({ success: false, message: error.message });
     }
 });
 
