@@ -86,6 +86,9 @@ function connectChatWs() {
 
     chatWs.onopen = () => {
         wsReconnectDelay = 1000; // reset backoff on successful connection
+        if (activeConversationId) {
+            sendChatPresence('open', activeConversationType, activeConversationId);
+        }
         if (callActive && callConversationId && callConversationType) {
             sendCallSignal({
                 type: 'call_join',
@@ -203,7 +206,7 @@ function connectChatWs() {
             if (data.conversationId === activeConversationId) {
                 const el = await buildMessageEl(data.message);
                 messagesContainer.appendChild(el);
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                scrollMessagesToBottom();
                 // Mark incoming messages as read immediately since the conversation is open
                 void markConversationRead();
             }
@@ -226,7 +229,7 @@ function connectChatWs() {
             if (data.groupId === activeConversationId) {
                 const el = await buildMessageEl(data.message);
                 messagesContainer.appendChild(el);
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                scrollMessagesToBottom();
                 // Mark incoming messages as read immediately since the conversation is open
                 void markConversationRead();
             }
@@ -377,6 +380,10 @@ const incomingCallText    = document.getElementById('incomingCallText')     as H
 const incomingCallAcceptBtn = document.getElementById('incomingCallAcceptBtn') as HTMLButtonElement;
 const incomingCallDeclineBtn = document.getElementById('incomingCallDeclineBtn') as HTMLButtonElement;
 
+function scrollMessagesToBottom() {
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
 let isResizingCallPanel = false;
 
 function showCallPanel() {
@@ -428,6 +435,17 @@ window.addEventListener('resize', () => {
 
 function sendCallSignal(payload: any) {
     if (chatWs.readyState !== WebSocket.OPEN) return;
+    chatWs.send(JSON.stringify(payload));
+}
+
+function sendChatPresence(action: 'open' | 'close', conversationType?: ConversationType, conversationId?: string) {
+    if (chatWs.readyState !== WebSocket.OPEN) return;
+
+    const payload: any = { type: 'chat_presence', action };
+    if (action === 'open') {
+        payload.conversationType = conversationType;
+        payload.conversationId = conversationId;
+    }
     chatWs.send(JSON.stringify(payload));
 }
 
@@ -851,6 +869,14 @@ conversationList.addEventListener('click', (e) => {
         return;
     }
 
+    // Mute button
+    const muteBtn = target.closest<HTMLElement>('.mute-btn');
+    if (muteBtn) {
+        const item = muteBtn.closest<HTMLElement>('.conversation-item')!;
+        toggleMute(item.dataset.id!, item.dataset.type as 'dm' | 'group', item, muteBtn);
+        return;
+    }
+
     // Conversation row
     const item = target.closest<HTMLElement>('.conversation-item');
     if (!item) return;
@@ -903,6 +929,7 @@ async function openConversation(id: string, item: HTMLElement) {
     avatarCache.clear();
     loadMessages(id);
     void markConversationRead();
+    sendChatPresence('open', 'dm', id);
 }
 
 async function openGroupConversation(id: string, item: HTMLElement) {
@@ -935,6 +962,7 @@ async function openGroupConversation(id: string, item: HTMLElement) {
     await refreshGroupKeyring(id);
     loadGroupMessages(id);
     void markConversationRead();
+    sendChatPresence('open', 'group', id);
 }
 
 // ── Group helpers ─────────────────────────────────────────────────────────────
@@ -1041,7 +1069,7 @@ async function renderMessages(messages: any[]) {
         const el = await buildMessageEl(msg);
         messagesContainer.appendChild(el);
     }
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    scrollMessagesToBottom();
 }
 
 async function buildMessageEl(msg: {
@@ -1226,10 +1254,10 @@ async function togglePin(id: string, type: 'dm' | 'group', item: HTMLElement, bt
 
         // Update pin icon
         const nameDiv = item.querySelector('.flex.items-center.gap-1') as HTMLElement;
-        const existingIcon = nameDiv.querySelector('span.text-warning');
+        const existingIcon = nameDiv.querySelector<HTMLElement>('.pin-icon');
         if (data.pinned && !existingIcon) {
             const icon = document.createElement('span');
-            icon.className = 'text-warning text-xs';
+            icon.className = 'pin-icon text-warning text-xs';
             icon.title = 'Pinned';
             icon.textContent = '📌';
             nameDiv.prepend(icon);
@@ -1245,6 +1273,38 @@ async function togglePin(id: string, type: 'dm' | 'group', item: HTMLElement, bt
             return ap - bp;
         });
         items.forEach(i => conversationList.appendChild(i));
+    } catch (err: any) {
+        alert(err.message);
+    }
+}
+
+async function toggleMute(id: string, type: 'dm' | 'group', item: HTMLElement, btn: HTMLElement) {
+    try {
+        const url = type === 'group' ? `/group/${id}/mute` : `/chat/${id}/mute`;
+        const res = await fetch(url, { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.message);
+
+        item.dataset.muted = data.muted ? 'true' : 'false';
+        btn.textContent = data.muted ? 'Unmute' : 'Mute';
+        btn.title = data.muted ? 'Unmute' : 'Mute';
+
+        const nameDiv = item.querySelector('.flex.items-center.gap-1') as HTMLElement;
+        const existingIcon = nameDiv.querySelector<HTMLElement>('.mute-icon');
+        if (data.muted && !existingIcon) {
+            const icon = document.createElement('span');
+            icon.className = 'mute-icon text-base-content/50 text-xs';
+            icon.title = 'Muted';
+            icon.textContent = '🔕';
+            const groupIcon = nameDiv.querySelector('span[title="Group chat"]');
+            if (groupIcon) {
+                groupIcon.insertAdjacentElement('beforebegin', icon);
+            } else {
+                nameDiv.appendChild(icon);
+            }
+        } else if (!data.muted && existingIcon) {
+            existingIcon.remove();
+        }
     } catch (err: any) {
         alert(err.message);
     }
@@ -1290,7 +1350,7 @@ async function startChat(friendId: string) {
         const data = await res.json();
         if (!data.success) throw new Error(data.message);
         // Redirect to chat page (which will load all convos including the new one)
-        window.location.href = `/chat?open=${data.conversationId}`;
+        window.location.href = `/chat?open=${data.conversationId}&type=dm`;
     } catch (err: any) {
         alert(err.message);
     }
@@ -1346,8 +1406,13 @@ unlockBtn.onclick = async () => {
 // ── Auto-open conversation from URL param (?open=id) ─────────────────────────
 const urlParams = new URLSearchParams(window.location.search);
 const openId = urlParams.get('open');
+const openType = urlParams.get('type');
 if (openId) {
-    const target = conversationList.querySelector<HTMLElement>(`.conversation-item[data-id="${openId}"]`);
+    const typedSelector = openType
+        ? `.conversation-item[data-id="${openId}"][data-type="${openType}"]`
+        : `.conversation-item[data-id="${openId}"]`;
+    const target = conversationList.querySelector<HTMLElement>(typedSelector)
+        ?? conversationList.querySelector<HTMLElement>(`.conversation-item[data-id="${openId}"]`);
     if (target) {
         if (target.dataset.type === 'group') {
             openGroupConversation(openId, target);
@@ -1408,7 +1473,12 @@ function closeActiveConversation() {
     messagesContainer.innerHTML = '<div id="messagesPlaceholder" class="m-auto text-base-content/30 text-sm select-none">Open a conversation to start chatting</div>';
     messageInput.disabled = true;
     sendBtn.disabled = true;
+    sendChatPresence('close');
 }
+
+window.addEventListener('beforeunload', () => {
+    sendChatPresence('close');
+});
 
 closeChatDeleteBtn.onclick = () => doCloseChat(true);
 closeChatOnlyBtn.onclick   = () => doCloseChat(false);
@@ -1645,7 +1715,7 @@ groupCreateBtn.onclick = async () => {
         const data = await res.json();
         if (!data.success) throw new Error(data.message);
         newGroupModal.close();
-        window.location.href = `/chat?open=${data.groupId}`;
+        window.location.href = `/chat?open=${data.groupId}&type=group`;
     } catch (err: any) {
         groupCreateError.textContent = err.message;
         groupCreateError.classList.remove('hidden');

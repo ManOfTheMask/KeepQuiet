@@ -263,6 +263,43 @@ describe('ChatController.togglePin', () => {
   });
 });
 
+// ── toggleMute ────────────────────────────────────────────────────────────────
+describe('ChatController.toggleMute', () => {
+  it('mutes an unmuted conversation', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    const result = await ChatController.toggleMute(conv._id.toString(), userA._id.toString());
+    expect(result.muted).toBe(true);
+  });
+
+  it('unmutes an already-muted conversation', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await ChatController.toggleMute(conv._id.toString(), userA._id.toString());
+    const result = await ChatController.toggleMute(conv._id.toString(), userA._id.toString());
+    expect(result.muted).toBe(false);
+  });
+
+  it('only affects the calling user\'s mute state', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await ChatController.toggleMute(conv._id.toString(), userA._id.toString());
+    const updated = await ConversationModel.findById(conv._id).lean();
+    expect(updated!.mutedBy.map(String)).not.toContain(userB._id.toString());
+  });
+
+  it('throws when user is not a participant', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await expect(
+      ChatController.toggleMute(conv._id.toString(), userC._id.toString()),
+    ).rejects.toThrow('Unauthorized.');
+  });
+
+  it('throws when conversation does not exist', async () => {
+    const fakeId = new mongoose.Types.ObjectId().toString();
+    await expect(
+      ChatController.toggleMute(fakeId, userA._id.toString()),
+    ).rejects.toThrow('Conversation not found.');
+  });
+});
+
 // ── markMessagesRead ──────────────────────────────────────────────────────────
 describe('ChatController.markMessagesRead', () => {
   it('adds the calling user to readBy on messages sent by the other participant', async () => {

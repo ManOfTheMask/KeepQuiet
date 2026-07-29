@@ -181,3 +181,25 @@ describe('NotificationController.dismiss', () => {
     expect(still).not.toBeNull();
   });
 });
+
+// ── dismissAll ───────────────────────────────────────────────────────────────
+describe('NotificationController.dismissAll', () => {
+  it('deletes all notifications for the specified user', async () => {
+    await makeNotification(uid1, { title: 'A' });
+    await makeNotification(uid1, { title: 'B' });
+    await makeNotification(uid2, { title: 'Other user' });
+
+    const result = await NotificationController.dismissAll(uid1);
+    expect(result.deletedCount).toBe(2);
+
+    const mine = await NotificationModel.find({ userId: uid1 }).lean();
+    const theirs = await NotificationModel.find({ userId: uid2 }).lean();
+    expect(mine).toHaveLength(0);
+    expect(theirs).toHaveLength(1);
+  });
+
+  it('returns 0 when user has no notifications', async () => {
+    const result = await NotificationController.dismissAll(uid1);
+    expect(result.deletedCount).toBe(0);
+  });
+});

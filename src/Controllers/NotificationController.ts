@@ -61,6 +61,14 @@ class NotificationController {
         if (!n.userId.equals(new mongoose.Types.ObjectId(userId))) throw new Error("Unauthorized.");
         await n.deleteOne();
     }
+
+    /** Permanently delete all notifications for a user (dismiss all). */
+    async dismissAll(userId: string) {
+        const result = await NotificationModel.deleteMany({
+            userId: new mongoose.Types.ObjectId(userId),
+        });
+        return { deletedCount: result.deletedCount ?? 0 };
+    }
 }
 
 export default new NotificationController();

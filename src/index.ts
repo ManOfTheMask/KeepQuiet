@@ -39,6 +39,7 @@ interface WsSessionState {
     userId: string;
     username: string;
     activeCallRoomKey: string | null;
+    activeChatView: { conversationType: CallRoomType; conversationId: string } | null;
 }
 
 interface PendingCallInvite {
@@ -144,6 +145,20 @@ function broadcastToUser(userId: string, data: object) {
 
 function sendWsJson(ws: WebSocket, data: object) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+}
+
+function userIsViewingConversation(userId: string, conversationType: CallRoomType, conversationId: string): boolean {
+    const sockets = connectedUsers.get(userId);
+    if (!sockets) return false;
+
+    for (const ws of sockets) {
+        const state = socketState.get(ws);
+        if (!state?.activeChatView) continue;
+        if (state.activeChatView.conversationType !== conversationType) continue;
+        if (state.activeChatView.conversationId !== conversationId) continue;
+        return true;
+    }
+    return false;
 }
 
 function makeCallRoomKey(roomType: CallRoomType, roomId: string): string {
@@ -403,6 +418,30 @@ async function handleCallSocketMessage(ws: WebSocket, data: any) {
     if (typeof type !== 'string') return;
 
     switch (type) {
+        case 'chat_presence': {
+            const state = socketState.get(ws);
+            if (!state) return;
+
+            const action: string = data?.action;
+            if (action === 'close') {
+                state.activeChatView = null;
+                return;
+            }
+
+            if (action !== 'open') return;
+
+            const conversationType: CallRoomType = data?.conversationType;
+            const conversationId: string = data?.conversationId;
+            if ((conversationType !== 'dm' && conversationType !== 'group') || !conversationId) {
+                return;
+            }
+
+            const authorized = await isUserAuthorizedForCall(conversationType, conversationId, state.userId);
+            if (!authorized) return;
+
+            state.activeChatView = { conversationType, conversationId };
+            return;
+        }
         case 'call_invite': {
             const state = socketState.get(ws);
             if (!state) return;
@@ -617,7 +656,7 @@ app.get('/', async (req: Request, res: Response) => {
             res.render('home', { title: 'Home', script: 'home', loggedIn: false });
             return;
         }
-        const recentNotifs = notifications.filter((n: any) => !n.read).slice(0, 5).map((n: any) => ({
+        const recentNotifs = notifications.slice(0, 5).map((n: any) => ({
             id: n._id.toString(),
             title: n.title,
             body: n.body,
@@ -941,6 +980,7 @@ app.get('/chat', requireAuth, async (req: Request, res: Response) => {
             otherUsername: c.other?.username ?? 'Unknown',
             lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt).toLocaleString() : null,
             pinned: c.pinned,
+            muted: c.muted,
         }));
 
         const serializedGroups = groups.map((g: any) => {
@@ -952,6 +992,7 @@ app.get('/chat', requireAuth, async (req: Request, res: Response) => {
                 memberList,
                 lastMessageAt: g.lastMessageAt ? new Date(g.lastMessageAt).toLocaleString() : null,
                 pinned: (g.pinnedBy ?? []).some((p: any) => p.equals(new mongoose.Types.ObjectId(userId))),
+                muted: (g.mutedBy ?? []).some((p: any) => p.equals(new mongoose.Types.ObjectId(userId))),
                 adminId: g.adminId?.toString() ?? null,
             };
         });
@@ -1091,12 +1132,19 @@ app.post('/chat/:conversationId/messages', requireAuth, async (req: Request, res
             for (const participantId of conv.participants as any[]) {
                 const pid = participantId.toString();
                 if (pid === req.session.userId!) continue;
+
+                const isMuted = (conv.mutedBy ?? []).some((m: any) => m.equals(participantId));
+                if (isMuted) continue;
+
+                // Avoid DM spam when the recipient already has this exact chat open.
+                if (userIsViewingConversation(pid, 'dm', req.params.conversationId)) continue;
+
                 const notif = await NotificationController.create(
                     pid,
                     'message',
                     `New message from ${sender.username}`,
                     '',
-                    `/chat?open=${req.params.conversationId}`,
+                    `/chat?open=${req.params.conversationId}&type=dm`,
                 );
                 broadcastToUser(pid, {
                     type: 'new_notification',
@@ -1147,6 +1195,19 @@ app.delete('/chat/:conversationId/messages/:messageId', requireAuth, async (req:
 app.post('/chat/:conversationId/pin', requireAuth, async (req: Request, res: Response) => {
     try {
         const result = await ChatController.togglePin(
+            req.params.conversationId,
+            req.session.userId!
+        );
+        res.json({ success: true, ...result });
+    } catch (error: any) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+// Toggle mute
+app.post('/chat/:conversationId/mute', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const result = await ChatController.toggleMute(
             req.params.conversationId,
             req.session.userId!
         );
@@ -1237,6 +1298,16 @@ app.delete('/notifications/:id', requireAuth, async (req: Request, res: Response
         res.json({ success: true });
     } catch (error: any) {
         res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+// Dismiss (delete) all notifications for the current user
+app.delete('/notifications', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const result = await NotificationController.dismissAll(req.session.userId!);
+        res.json({ success: true, ...result });
+    } catch (error: any) {
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -1516,6 +1587,38 @@ app.post('/group/:groupId/messages', requireAuth, async (req: Request, res: Resp
             for (const m of group.members as any[]) {
                 broadcastToUser(m.userId.toString(), wsMsg);
             }
+
+            // Create notifications for every member except sender, respecting per-group mute
+            for (const m of group.members as any[]) {
+                const recipientId = m.userId.toString();
+                if (recipientId === req.session.userId!) continue;
+
+                const isMuted = (group.mutedBy ?? []).some((uid: any) => uid.equals(m.userId));
+                if (isMuted) continue;
+
+                 // Avoid group-chat notification spam when the recipient already has this group open.
+                if (userIsViewingConversation(recipientId, 'group', req.params.groupId)) continue;
+
+                const notif = await NotificationController.create(
+                    recipientId,
+                    'message',
+                    `New message in group from ${sender.username}`,
+                    '',
+                    `/chat?open=${req.params.groupId}&type=group`,
+                );
+                broadcastToUser(recipientId, {
+                    type: 'new_notification',
+                    notification: {
+                        id: notif._id.toString(),
+                        type: notif.type,
+                        title: notif.title,
+                        body: notif.body,
+                        link: notif.link,
+                        read: notif.read,
+                        createdAt: notif.createdAt,
+                    },
+                });
+            }
         }
 
         res.json({ success: true, messageId: message._id.toString() });
@@ -1643,6 +1746,16 @@ app.post('/group/:groupId/pin', requireAuth, async (req: Request, res: Response)
     }
 });
 
+// Toggle mute for a group
+app.post('/group/:groupId/mute', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const result = await GroupController.toggleMute(req.params.groupId, req.session.userId!);
+        res.json({ success: true, ...result });
+    } catch (err: any) {
+        res.status(400).json({ success: false, message: err.message });
+    }
+});
+
 // Delete a group — admin only
 app.delete('/group/:groupId', requireAuth, async (req: Request, res: Response) => {
     try {
@@ -1720,7 +1833,7 @@ wss.on('connection', (ws, req) => {
             const username = user?.username ?? 'Unknown';
 
             addUserSocket(userId, ws);
-            socketState.set(ws, { userId, username, activeCallRoomKey: null });
+            socketState.set(ws, { userId, username, activeCallRoomKey: null, activeChatView: null });
 
             // Track whether this client is still alive between pings
             (ws as any).isAlive = true;

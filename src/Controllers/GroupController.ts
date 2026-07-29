@@ -38,10 +38,15 @@ class GroupController {
     async getGroupsForUser(userId: string) {
         const uid = new mongoose.Types.ObjectId(userId);
 
-        return await GroupConversationModel.find({ "members.userId": uid })
+        const groups = await GroupConversationModel.find({ "members.userId": uid })
             .populate('members.userId', 'username')
             .sort({ lastMessageAt: -1 })
             .lean();
+
+        return groups.map((g: any) => ({
+            ...g,
+            muted: (g.mutedBy ?? []).some((p: any) => p.equals(uid)),
+        }));
     }
 
     /** Get group info (name, admin, member list) — must be a member. */
@@ -313,6 +318,27 @@ class GroupController {
         } else {
             await GroupConversationModel.findByIdAndUpdate(gid, { $addToSet: { pinnedBy: uid } });
             return { pinned: true };
+        }
+    }
+
+    /** Toggle mute for a user on a group. */
+    async toggleMute(groupId: string, userId: string) {
+        const gid = new mongoose.Types.ObjectId(groupId);
+        const uid = new mongoose.Types.ObjectId(userId);
+
+        const group = await GroupConversationModel.findById(gid);
+        if (!group) throw new Error("Group not found.");
+
+        const isMember = (group.members as any[]).some((m: any) => m.userId.equals(uid));
+        if (!isMember) throw new Error("Unauthorized.");
+
+        const isMuted = (group.mutedBy as any[]).some((p: any) => p.equals(uid));
+        if (isMuted) {
+            await GroupConversationModel.findByIdAndUpdate(gid, { $pull: { mutedBy: uid } });
+            return { muted: false };
+        } else {
+            await GroupConversationModel.findByIdAndUpdate(gid, { $addToSet: { mutedBy: uid } });
+            return { muted: true };
         }
     }
 }
