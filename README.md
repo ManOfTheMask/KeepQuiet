@@ -4,7 +4,7 @@
 
 # KeepQuiet
 
-> **⚠ Work in progress — not yet at v1.0**
+> **⚠ Work in progress — KeepQuiet is nearing the V1.0 release.**
 
 KeepQuiet is a self-hostable, end-to-end encrypted messaging application. All encryption and decryption happens entirely in the browser using [OpenPGP.js](https://openpgpjs.org/). The server never sees plaintext messages or private keys — it only stores ciphertext and public keys.
 
@@ -16,10 +16,13 @@ KeepQuiet is a self-hostable, end-to-end encrypted messaging application. All en
 - **PGP challenge-response login** — no passwords; authentication is proven by decrypting a server challenge with your private key
 - **Real-time messaging** — WebSocket delivery so messages appear instantly without refreshing
 - **Real-time notifications** — in-app notification bell for new messages and friend requests, pushed via WebSocket
+- **Notification quality controls** — mute/unmute per DM or group, browser notification toggle, and automatic suppression when you already have that chat open
 - **Friends system** — send, accept, and decline friend requests by sharing your public key; remove friends and permanently delete your conversation with them in one action
 - **Conversation management** — pin conversations, close a DM (with the option to delete all messages), and re-open it later by messaging the same friend again
 - **Message deletion** — soft-delete individual messages; deleted messages show a placeholder to all participants
+- **Emoji reactions (DMs + groups)** — react to individual messages with emoji chips, live counts, and one-tap toggles in real time
 - **Read receipts (DMs + groups)** — sent messages show delivery/read state; DMs use checkmarks and groups show per-reader chips with timestamps
+- **Chat usability improvements** — scrollable message pane with stable auto-scroll behavior for incoming messages
 - **Dashboard** — logged-in users see a summary of stats (friend count, messages sent, unread notifications, pending requests), quick-action buttons, and an inline accept/decline panel for incoming friend requests
 - **Profile page** — displays your username, member-since date, and your full ASCII-armored PGP public key with a one-click copy-to-clipboard button
 - **Profile pictures (avatars)** — upload/crop a profile picture from the profile page; avatars are shown on the dashboard and in chat
@@ -52,8 +55,10 @@ KeepQuiet uses a **PGP challenge-response** flow instead of passwords:
 - Messages are encrypted in the browser with the recipient's public key (and your own, so you can read your sent messages) before being sent.
 - Real-time delivery is handled via **WebSockets**. The server stores only encrypted ciphertext.
 - Read receipts are tracked per message using `readBy` entries (`userId`, `readAt`).
+- Reactions are tracked per message using `reactions` entries (`emoji`, `users[]`).
 - The client marks messages as read when you view a conversation, then broadcasts a real-time receipt update.
 - In DMs, outgoing messages show single-check (sent) and double-check (read). In groups, outgoing messages show per-reader chips.
+- Both DMs and groups support emoji reactions with live count updates.
 - You can soft-delete any message you sent.
 - You can close a conversation (hide it from your sidebar). When closing, you are prompted to either keep the messages or permanently delete them. Opening a new chat with the same friend restores the conversation.
 
@@ -67,7 +72,10 @@ KeepQuiet uses a **PGP challenge-response** flow instead of passwords:
 - A bell icon in the navbar shows unread notifications with a live badge count.
 - Notifications are pushed in real time via WebSocket when a friend request is received or a new message arrives.
 - Each notification has a **Mark read** button and a **Dismiss** button (permanently deletes the notification).
-- **Mark all read** clears the badge in one click.
+- Both navbar and home dashboard recent-notifications panels stay synchronized in real time.
+- **Mark all read** and **Dismiss all** are available for bulk actions.
+- Browser notifications can be toggled on/off directly in the toolbar.
+- Message notifications are suppressed when the recipient is already viewing that exact DM/group conversation.
 
 ### Group Chats
 - Groups can have 2–10 members; each member's public key is stored in the group's **key ring** at join time.
@@ -110,6 +118,7 @@ All real-time communication goes through a single WebSocket endpoint at `/ws`. T
 | Server → Client | `new_message` | `{ conversationId, message: { id, senderUsername, senderId, content, deleted, createdAt } }` |
 | Server → Client | `new_notification` | `{ notification: { id, type, title, body, link, read, createdAt } }` |
 | Server → Client | `message_deleted` | `{ conversationId, messageId }` |
+| Server → Client | `message_reaction_updated` | `{ conversationId, messageId, reactions: [{ emoji, users[] }] }` |
 | Server → Client | `read_receipt` | `{ conversationId, userId, username, readAt }` |
 | Server → Client | `__ping__` | keepalive ping (string literal) |
 | Client → Server | `__pong__` | keepalive response (string literal) |
@@ -119,11 +128,13 @@ All real-time communication goes through a single WebSocket endpoint at `/ws`. T
 |---|---|---|
 | Server → Client | `new_group_message` | `{ groupId, message: { id, senderUsername, senderId, content, deleted, createdAt } }` |
 | Server → Client | `group_message_deleted` | `{ groupId, messageId }` |
+| Server → Client | `group_message_reaction_updated` | `{ groupId, messageId, reactions: [{ emoji, users[] }] }` |
 | Server → Client | `group_member_added` | `{ groupId, userId, username }` |
 | Server → Client | `group_member_removed` | `{ groupId, userId }` |
 | Server → Client | `group_deleted` | `{ groupId }` |
 | Server → Client | `group_renamed` | `{ groupId, name }` |
 | Server → Client | `group_read_receipt` | `{ groupId, userId, username, readAt }` |
+| Client → Server | `chat_presence` | `{ action: 'open'|'close', conversationType?, conversationId? }` |
 
 #### Call signaling events
 | Direction | Event type | Payload |
@@ -182,6 +193,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `participants` | ObjectId[] | exactly 2; references User |
 | `lastMessageAt` | datetime | used for sorting |
 | `pinnedBy` | ObjectId[] | users who pinned this conversation |
+| `mutedBy` | ObjectId[] | users who muted this conversation |
 | `hiddenBy` | ObjectId[] | users who closed/hid this conversation |
 | `createdAt` | datetime | |
 
@@ -193,6 +205,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `content` | string | PGP-encrypted ciphertext |
 | `deletedAt` | datetime | set when soft-deleted; `null` otherwise |
 | `readBy` | `{ userId: ObjectId, readAt: datetime }[]` | users who have read this message |
+| `reactions` | `{ emoji: string, users: ObjectId[] }[]` | reaction buckets keyed by emoji |
 | `createdAt` | datetime | |
 
 ### FriendRequest
@@ -221,6 +234,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `adminId` | ObjectId | references User; the group creator/current admin |
 | `members` | `{ userId: ObjectId, publicKeyArmored: string }[]` | 1–10 entries; forms the encryption key ring |
 | `pinnedBy` | ObjectId[] | users who pinned this group |
+| `mutedBy` | ObjectId[] | users who muted this group |
 | `lastMessageAt` | datetime \| null | used for sorting |
 | `createdAt` | datetime | |
 
@@ -232,6 +246,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `content` | string | PGP-encrypted ciphertext (encrypted for every member's key) |
 | `deletedAt` | datetime | set when soft-deleted; `null` otherwise |
 | `readBy` | `{ userId: ObjectId, readAt: datetime }[]` | members who have read this message |
+| `reactions` | `{ emoji: string, users: ObjectId[] }[]` | reaction buckets keyed by emoji |
 | `createdAt` | datetime | |
 
 ---
@@ -281,7 +296,9 @@ Connections that miss two consecutive pings are terminated automatically.
 | `POST` | `/chat/:conversationId/read` | Mark all unread messages in a conversation as read (current user) |
 | `POST` | `/chat/:conversationId/messages` | Send a message |
 | `DELETE` | `/chat/:conversationId/messages/:messageId` | Soft-delete a message |
+| `POST` | `/chat/:conversationId/messages/:messageId/reactions` | Toggle an emoji reaction on a DM message |
 | `POST` | `/chat/:conversationId/pin` | Toggle pin for a conversation |
+| `POST` | `/chat/:conversationId/mute` | Toggle mute for a conversation |
 | `DELETE` | `/chat/:conversationId` | Close (and optionally delete messages in) a conversation |
 | `GET` | `/chat/:conversationId/recipient-key` | Fetch the recipient's public key for encryption |
 
@@ -291,6 +308,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `GET` | `/notifications` | List all notifications for the current user |
 | `POST` | `/notifications/read-all` | Mark all notifications as read |
 | `POST` | `/notifications/:id/read` | Mark a single notification as read |
+| `DELETE` | `/notifications` | Dismiss all notifications |
 | `DELETE` | `/notifications/:id` | Dismiss (permanently delete) a notification |
 
 ### Group Chats
@@ -303,10 +321,12 @@ Connections that miss two consecutive pings are terminated automatically.
 | `POST` | `/group/:groupId/read` | Mark all unread messages in a group as read (current user) |
 | `POST` | `/group/:groupId/messages` | Send a message to a group |
 | `DELETE` | `/group/:groupId/messages/:messageId` | Soft-delete a group message (sender only) |
+| `POST` | `/group/:groupId/messages/:messageId/reactions` | Toggle an emoji reaction on a group message |
 | `POST` | `/group/:groupId/invite` | Invite a user to the group (any member) |
 | `DELETE` | `/group/:groupId/members/:memberId` | Kick a member (admin only) |
 | `POST` | `/group/:groupId/leave` | Leave the group |
 | `POST` | `/group/:groupId/pin` | Toggle pin for the group |
+| `POST` | `/group/:groupId/mute` | Toggle mute for the group |
 | `PATCH` | `/group/:groupId/name` | Rename the group (any member) |
 | `DELETE` | `/group/:groupId` | Delete the group entirely (admin only) |
 
@@ -357,10 +377,10 @@ There are no separate REST call routes; call state is synchronized via the event
 
 - ~~**Theme picker** — let users choose from DaisyUI's built-in themes or customise accent colours~~
 - ~~**Group chats** — multi-participant conversations with shared group key management up to 10 people~~
-- **Message reactions** — emoji reactions on individual messages
+- ~~**Message reactions** — emoji reactions on individual messages~~
 - ~~**Read receipts** — show when a message has been seen by the recipient~~
 - **File / image sharing** — encrypted attachment support
-- **Notification preferences** — per-conversation mute and global notification settings
+- **Notification preferences** — advanced controls (quiet hours, mention-only rules, per-device behavior)
 - ~~**E2EE Voice & Video Chat** — E2EE Voice & Video Chat for 10 people~~
 - ~~**Call invites + timeout handling** — incoming call modal, accept/decline, missed/expired statuses~~
 - ~~**Screen sharing in calls** — switch outgoing video track to display capture and restore camera~~
@@ -384,3 +404,9 @@ There are no separate REST call routes; call state is synchronized via the event
 ## Contributing
 
 Contributions are welcome as long as they align with the goal of the project: private, self-hosted, end-to-end encrypted messaging that is simple to use.
+
+---
+
+## Release Progress
+
+KeepQuiet is now in late-stage feature polishing and adding and is **nearing a V1.0 release**.
