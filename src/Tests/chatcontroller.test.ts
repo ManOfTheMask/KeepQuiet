@@ -123,6 +123,63 @@ describe('ChatController.sendMessage', () => {
     ).rejects.toThrow('Message content cannot be empty.');
   });
 
+  it('allows attachment-only messages', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    const attachmentId = new mongoose.Types.ObjectId().toString();
+    const msg = await ChatController.sendMessage(
+      conv._id.toString(),
+      userA._id.toString(),
+      '',
+      {
+        attachmentId,
+        fileName: 'photo.png',
+        mimeType: 'image/png',
+        sizeBytes: 1234,
+        encryptedSizeBytes: 1500,
+      },
+    );
+
+    expect(msg.content).toBe('[Attachment]');
+    expect((msg as any).attachment.fileId.toString()).toBe(attachmentId);
+    expect((msg as any).attachment.fileName).toBe('photo.png');
+  });
+
+  it('stores placeholder content for attachment-only messages so clients do not decrypt empty strings', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    const msg = await ChatController.sendMessage(
+      conv._id.toString(),
+      userA._id.toString(),
+      '   ',
+      {
+        attachmentId: new mongoose.Types.ObjectId().toString(),
+        fileName: 'sample.bin',
+        mimeType: 'application/octet-stream',
+        sizeBytes: 512,
+        encryptedSizeBytes: 768,
+      },
+    );
+
+    expect(msg.content).toBe('[Attachment]');
+  });
+
+  it('rejects invalid attachment metadata', async () => {
+    const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
+    await expect(
+      ChatController.sendMessage(
+        conv._id.toString(),
+        userA._id.toString(),
+        '',
+        {
+          attachmentId: 'bad-id',
+          fileName: 'file.bin',
+          mimeType: 'application/octet-stream',
+          sizeBytes: 10,
+          encryptedSizeBytes: 20,
+        },
+      ),
+    ).rejects.toThrow('Invalid attachment id.');
+  });
+
   it('throws when sender is not a participant', async () => {
     const conv = await ChatController.getOrCreateConversation(userA._id.toString(), userB._id.toString());
     await expect(

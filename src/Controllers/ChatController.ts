@@ -2,6 +2,47 @@ import ConversationModel from "../Models/ConversationModel";
 import MessageModel from "../Models/MessageModel";
 import mongoose from "mongoose";
 
+interface MessageAttachmentInput {
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    encryptedSizeBytes: number;
+}
+
+const ATTACHMENT_PLACEHOLDER_CONTENT = "[Attachment]";
+
+function normalizeAttachment(attachment?: MessageAttachmentInput) {
+    if (!attachment) return null;
+    const {
+        attachmentId,
+        fileName,
+        mimeType,
+        sizeBytes,
+        encryptedSizeBytes,
+    } = attachment;
+
+    if (!mongoose.Types.ObjectId.isValid(attachmentId)) {
+        throw new Error("Invalid attachment id.");
+    }
+    if (!fileName?.trim()) throw new Error("Attachment fileName is required.");
+    if (!mimeType?.trim()) throw new Error("Attachment mimeType is required.");
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+        throw new Error("Attachment sizeBytes must be a positive number.");
+    }
+    if (!Number.isFinite(encryptedSizeBytes) || encryptedSizeBytes <= 0) {
+        throw new Error("Attachment encryptedSizeBytes must be a positive number.");
+    }
+
+    return {
+        fileId: new mongoose.Types.ObjectId(attachmentId),
+        fileName: fileName.trim(),
+        mimeType: mimeType.trim(),
+        sizeBytes,
+        encryptedSizeBytes,
+    };
+}
+
 class ChatController {
     /** Get or create a 1-to-1 conversation between two users. */
     async getOrCreateConversation(userIdA: string, userIdB: string) {
@@ -41,8 +82,17 @@ class ChatController {
     }
 
     /** Send a message in a conversation. */
-    async sendMessage(conversationId: string, senderId: string, content: string) {
-        if (!content?.trim()) throw new Error("Message content cannot be empty.");
+    async sendMessage(
+        conversationId: string,
+        senderId: string,
+        content: string,
+        attachment?: MessageAttachmentInput,
+    ) {
+        const normalizedContent = content?.trim() ?? "";
+        const normalizedAttachment = normalizeAttachment(attachment);
+        if (!normalizedContent && !normalizedAttachment) {
+            throw new Error("Message content cannot be empty.");
+        }
 
         const cid = new mongoose.Types.ObjectId(conversationId);
         const sid = new mongoose.Types.ObjectId(senderId);
@@ -56,7 +106,8 @@ class ChatController {
         const message = await MessageModel.create({
             conversationId: cid,
             senderId: sid,
-            content: content.trim(),
+            content: normalizedContent || ATTACHMENT_PLACEHOLDER_CONTENT,
+            attachment: normalizedAttachment,
         });
 
         conv.lastMessageAt = new Date();
@@ -124,6 +175,7 @@ class ChatController {
     async closeConversation(conversationId: string, userId: string, deleteMessages: boolean) {
         const cid = new mongoose.Types.ObjectId(conversationId);
         const uid = new mongoose.Types.ObjectId(userId);
+        let deletedAttachmentIds: string[] = [];
 
         const conv = await ConversationModel.findById(cid);
         if (!conv) throw new Error("Conversation not found.");
@@ -132,6 +184,15 @@ class ChatController {
         }
 
         if (deleteMessages) {
+            const messagesWithAttachments = await MessageModel.find(
+                { conversationId: cid, deletedAt: null, attachment: { $ne: null } },
+                { 'attachment.fileId': 1 },
+            ).lean();
+
+            deletedAttachmentIds = messagesWithAttachments
+                .map((m: any) => m?.attachment?.fileId?.toString())
+                .filter((id: string | undefined): id is string => !!id);
+
             await MessageModel.updateMany(
                 { conversationId: cid, deletedAt: null },
                 { $set: { deletedAt: new Date() } },
@@ -140,6 +201,7 @@ class ChatController {
 
         // Mark as hidden for this user (un-hide it if already hidden so the call is idempotent)
         await ConversationModel.findByIdAndUpdate(cid, { $addToSet: { hiddenBy: uid } });
+        return { deletedAttachmentIds };
     }
 
     /** Toggle pin for the calling user on a conversation. */

@@ -1,5 +1,5 @@
 // @ts-ignore
-import { encryptChatMessage, encryptGroupMessage, decryptMessageWithKey } from '../jslibs/PGPUtils.js';
+import { encryptChatMessage, encryptGroupMessage, decryptMessageWithKey, encryptBinaryForKeys, encryptBinaryStreamForKeys, decryptBinaryMessageWithKey } from '../jslibs/PGPUtils.js';
 import { CallManager } from './callManager';
 
 type ConversationType = 'dm' | 'group';
@@ -49,6 +49,24 @@ const renderedMessageIds = new Set<string>();
 
 type MessageReaction = { emoji: string; users: string[] };
 
+type MessageAttachment = {
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    encryptedSizeBytes: number;
+};
+
+type DecryptedAttachmentCacheEntry = {
+    blob: Blob;
+    objectUrl: string;
+};
+
+const ATTACHMENT_PLACEHOLDER_CONTENT = '[Attachment]';
+const MAX_CHAT_ATTACHMENT_SIZE_BYTES = 5 * 1024 * 1024 * 1024;
+const PREVIEWABLE_MIME_PREFIXES = ['image/', 'video/', 'audio/', 'text/'];
+const PREVIEWABLE_MIME_TYPES = new Set(['application/pdf']);
+
 const REACTION_EMOJIS = [
     '😀', '😂', '😍', '🥳', '😎', '🤯', '😭', '😡',
     '👍', '👎', '👏', '🙏', '💯', '🔥', '❤️', '💔',
@@ -59,6 +77,7 @@ const REACTION_EMOJIS = [
 let activeReactionPicker: HTMLDivElement | null = null;
 let activeReactionAnchor: HTMLElement | null = null;
 let activeReactionMessageId: string | null = null;
+const decryptedAttachmentCache = new Map<string, DecryptedAttachmentCacheEntry>();
 
 // PGP credentials — loaded from sessionStorage (populated on login or via unlock overlay)
 // Read as functions so they always reflect the latest value after an in-page unlock
@@ -359,6 +378,8 @@ const friendPickerList   = document.getElementById('friendPickerList')     as HT
 const chatHeaderName     = document.getElementById('chatHeaderName')       as HTMLSpanElement;
 const messagesContainer  = document.getElementById('messagesContainer')    as HTMLDivElement;
 const messagesPlaceholder = document.getElementById('messagesPlaceholder') as HTMLDivElement | null;
+const attachmentInput    = document.getElementById('attachmentInput')      as HTMLInputElement;
+const attachBtn          = document.getElementById('attachBtn')            as HTMLButtonElement;
 const messageInput       = document.getElementById('messageInput')         as HTMLTextAreaElement;
 const sendBtn            = document.getElementById('sendBtn')              as HTMLButtonElement;
 const closeChatBtn       = document.getElementById('closeChatBtn')         as HTMLButtonElement;
@@ -1139,6 +1160,7 @@ async function openConversation(id: string, item: HTMLElement) {
 
     messageInput.disabled = false;
     sendBtn.disabled = false;
+    attachBtn.disabled = false;
     messageInput.focus();
 
     // Fetch recipient public key from server (avoids HTML-attribute encoding issues)
@@ -1181,6 +1203,7 @@ async function openGroupConversation(id: string, item: HTMLElement) {
 
     messageInput.disabled = false;
     sendBtn.disabled = false;
+    attachBtn.disabled = false;
     messageInput.focus();
 
     renderedMessageIds.clear();
@@ -1299,6 +1322,221 @@ async function renderMessages(messages: any[]) {
     scrollMessagesToBottom();
 }
 
+function formatBytes(sizeBytes: number): string {
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let unitIndex = 0;
+    let value = sizeBytes;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+    }
+    const rounded = unitIndex === 0 ? Math.round(value).toString() : value.toFixed(2);
+    return `${rounded} ${units[unitIndex]}`;
+}
+
+function isPreviewableMimeType(mimeType: string): boolean {
+    if (!mimeType) return false;
+    if (PREVIEWABLE_MIME_TYPES.has(mimeType)) return true;
+    return PREVIEWABLE_MIME_PREFIXES.some(prefix => mimeType.startsWith(prefix));
+}
+
+function getAttachmentEncryptionKeys(): string[] {
+    const myKey = pgpPublicKey();
+    if (!myKey) {
+        throw new Error('Encryption keys not loaded. Please unlock encryption first.');
+    }
+
+    if (activeConversationType === 'group') {
+        if (!activeGroupKeyring.length) {
+            throw new Error('No encryption keys available for this group.');
+        }
+        const candidateKeys = [...new Set([...activeGroupKeyring, myKey])];
+        const invalid = candidateKeys.filter((key) =>
+            !key.includes('-----BEGIN PGP PUBLIC KEY BLOCK-----')
+            || !key.includes('-----END PGP PUBLIC KEY BLOCK-----'),
+        );
+        if (invalid.length > 0) {
+            throw new Error('One or more group members have invalid PGP public keys. Ask them to re-import their key and refresh the chat.');
+        }
+        return candidateKeys;
+    }
+
+    if (!activeReceiverPublicKey) {
+        throw new Error('Cannot attach file: recipient public key is unavailable.');
+    }
+    return [...new Set([activeReceiverPublicKey, myKey])];
+}
+
+async function getDecryptedAttachment(attachment: MessageAttachment): Promise<DecryptedAttachmentCacheEntry> {
+    const cached = decryptedAttachmentCache.get(attachment.attachmentId);
+    if (cached) return cached;
+
+    if (!hasCredentials()) {
+        throw new Error('Encryption is locked. Unlock your private key first.');
+    }
+
+    const response = await fetch(`/attachments/${attachment.attachmentId}`);
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(body || 'Failed to download attachment.');
+    }
+
+    const encryptedBytes = new Uint8Array(await response.arrayBuffer());
+    const decryptedBytes = await decryptBinaryMessageWithKey(
+        encryptedBytes,
+        pgpPrivateKey()!,
+        pgpPassphrase()!,
+    );
+    const blob = new Blob([decryptedBytes], {
+        type: attachment.mimeType || 'application/octet-stream',
+    });
+    const entry: DecryptedAttachmentCacheEntry = {
+        blob,
+        objectUrl: URL.createObjectURL(blob),
+    };
+    decryptedAttachmentCache.set(attachment.attachmentId, entry);
+    return entry;
+}
+
+function triggerBrowserDownload(url: string, fileName: string) {
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+}
+
+function renderAttachmentPreview(previewContainer: HTMLElement, attachment: MessageAttachment, entry: DecryptedAttachmentCacheEntry) {
+    previewContainer.innerHTML = '';
+
+    if (attachment.mimeType.startsWith('image/')) {
+        const img = document.createElement('img');
+        img.src = entry.objectUrl;
+        img.alt = attachment.fileName;
+        img.className = 'max-h-72 rounded-lg border border-base-300 object-contain bg-black/10';
+        previewContainer.appendChild(img);
+        return;
+    }
+
+    if (attachment.mimeType.startsWith('video/')) {
+        const video = document.createElement('video');
+        video.src = entry.objectUrl;
+        video.controls = true;
+        video.className = 'max-h-72 rounded-lg border border-base-300';
+        previewContainer.appendChild(video);
+        return;
+    }
+
+    if (attachment.mimeType.startsWith('audio/')) {
+        const audio = document.createElement('audio');
+        audio.src = entry.objectUrl;
+        audio.controls = true;
+        audio.className = 'w-full';
+        previewContainer.appendChild(audio);
+        return;
+    }
+
+    if (attachment.mimeType === 'application/pdf') {
+        const frame = document.createElement('iframe');
+        frame.src = entry.objectUrl;
+        frame.className = 'w-full h-72 rounded-lg border border-base-300 bg-base-100';
+        frame.title = attachment.fileName;
+        previewContainer.appendChild(frame);
+        return;
+    }
+
+    if (attachment.mimeType.startsWith('text/')) {
+        entry.blob.text().then((text) => {
+            const pre = document.createElement('pre');
+            pre.className = 'max-h-72 overflow-auto rounded-lg border border-base-300 bg-base-100 p-3 text-xs';
+            pre.textContent = text;
+            previewContainer.appendChild(pre);
+        }).catch(() => {
+            previewContainer.textContent = 'Could not render preview.';
+        });
+        return;
+    }
+
+    previewContainer.textContent = 'Preview is not available for this file type.';
+}
+
+function buildAttachmentCard(attachment: MessageAttachment): HTMLElement {
+    const container = document.createElement('div');
+    container.className = 'mt-2 rounded-xl border border-base-300 bg-base-200/60 p-3 text-xs';
+
+    const title = document.createElement('div');
+    title.className = 'font-semibold truncate';
+    title.textContent = attachment.fileName;
+
+    const meta = document.createElement('div');
+    meta.className = 'opacity-70 mt-1';
+    meta.textContent = `${attachment.mimeType || 'application/octet-stream'} • ${formatBytes(attachment.sizeBytes)}`;
+
+    const actions = document.createElement('div');
+    actions.className = 'mt-2 flex flex-wrap gap-2';
+
+    const downloadBtn = document.createElement('button');
+    downloadBtn.type = 'button';
+    downloadBtn.className = 'btn btn-xs btn-outline';
+    downloadBtn.textContent = 'Decrypt & Download';
+
+    const previewBtn = document.createElement('button');
+    previewBtn.type = 'button';
+    previewBtn.className = 'btn btn-xs btn-ghost';
+    previewBtn.textContent = 'Preview';
+    if (!isPreviewableMimeType(attachment.mimeType)) {
+        previewBtn.disabled = true;
+        previewBtn.classList.add('opacity-50');
+    }
+
+    const status = document.createElement('div');
+    status.className = 'mt-2 text-xs opacity-70';
+
+    const preview = document.createElement('div');
+    preview.className = 'mt-2';
+
+    downloadBtn.onclick = async () => {
+        downloadBtn.disabled = true;
+        status.textContent = 'Decrypting file...';
+        try {
+            const entry = await getDecryptedAttachment(attachment);
+            triggerBrowserDownload(entry.objectUrl, attachment.fileName);
+            status.textContent = 'Ready.';
+        } catch (err: any) {
+            status.textContent = err.message ?? 'Failed to decrypt attachment.';
+        } finally {
+            downloadBtn.disabled = false;
+        }
+    };
+
+    previewBtn.onclick = async () => {
+        previewBtn.disabled = true;
+        status.textContent = 'Preparing preview...';
+        try {
+            const entry = await getDecryptedAttachment(attachment);
+            renderAttachmentPreview(preview, attachment, entry);
+            status.textContent = 'Preview ready.';
+        } catch (err: any) {
+            status.textContent = err.message ?? 'Failed to load preview.';
+        } finally {
+            previewBtn.disabled = !isPreviewableMimeType(attachment.mimeType);
+        }
+    };
+
+    actions.appendChild(downloadBtn);
+    actions.appendChild(previewBtn);
+
+    container.appendChild(title);
+    container.appendChild(meta);
+    container.appendChild(actions);
+    container.appendChild(status);
+    container.appendChild(preview);
+    return container;
+}
+
 async function buildMessageEl(msg: {
     id: string;
     senderUsername: string;
@@ -1309,6 +1547,7 @@ async function buildMessageEl(msg: {
     createdAtMs?: number;
     readBy?: { userId: string; username: string; readAt: string | null }[];
     reactions?: MessageReaction[];
+    attachment?: MessageAttachment | null;
 }) {
     const isMine = currentUserId && msg.senderId === currentUserId;
 
@@ -1355,11 +1594,22 @@ async function buildMessageEl(msg: {
     bubble.className = `relative max-w-sm px-4 py-2 rounded-2xl text-sm shadow
         ${msg.deleted ? 'bg-base-200 text-base-content/40 italic' : isMine ? 'bg-primary text-primary-content' : 'bg-base-100 text-base-content'}`;
 
+    const isAttachmentOnlyPlaceholder = !!msg.attachment && displayContent === ATTACHMENT_PLACEHOLDER_CONTENT;
+    const messageBodyHtml = msg.deleted
+        ? 'This message was deleted.'
+        : isAttachmentOnlyPlaceholder
+            ? ''
+            : escHtml(displayContent);
+
     bubble.innerHTML = `
         <span class="block text-xs font-semibold mb-1 opacity-70">${escHtml(msg.senderUsername)}</span>
-        <span>${msg.deleted ? 'This message was deleted.' : escHtml(displayContent)}</span>
+        ${messageBodyHtml ? `<span>${messageBodyHtml}</span>` : ''}
         ${decryptFailed ? '<span class="block text-xs opacity-50 mt-1">⚠ Could not decrypt</span>' : ''}
     `;
+
+    if (!msg.deleted && msg.attachment) {
+        bubble.appendChild(buildAttachmentCard(msg.attachment));
+    }
 
     // Delete button (own messages only, not already deleted)
     if (isMine && !msg.deleted) {
@@ -1396,6 +1646,58 @@ async function buildMessageEl(msg: {
 }
 
 // ── Send message ──────────────────────────────────────────────────────────────
+async function sendEncryptedMessage(content: string, attachment?: MessageAttachment) {
+    if (!activeConversationId) return;
+
+    const trimmedContent = content.trim();
+    if (!trimmedContent && !attachment) return;
+
+    let payload = '';
+    let url = '';
+
+    if (trimmedContent) {
+        if (activeConversationType === 'group') {
+            if (!activeGroupKeyring.length) throw new Error('No encryption keys available for this group.');
+            const myKey = pgpPublicKey();
+            const allKeys = myKey ? [...activeGroupKeyring, myKey] : activeGroupKeyring;
+            payload = await encryptGroupMessage(trimmedContent, allKeys);
+            url = `/group/${activeConversationId}/messages`;
+        } else {
+            if (!activeReceiverPublicKey) throw new Error('Cannot send message: recipient public key is unavailable.');
+            const myKey = pgpPublicKey();
+            if (!myKey) throw new Error('Encryption keys not loaded. Please unlock encryption first.');
+            payload = await encryptChatMessage(trimmedContent, activeReceiverPublicKey, myKey);
+            url = `/chat/${activeConversationId}/messages`;
+        }
+    } else {
+        url = activeConversationType === 'group'
+            ? `/group/${activeConversationId}/messages`
+            : `/chat/${activeConversationId}/messages`;
+    }
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: payload, attachment }),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.message);
+}
+
+function isStreamingFetchTransportError(err: unknown): boolean {
+    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    return message.includes('failed to fetch')
+        || message.includes('networkerror')
+        || message.includes('duplex')
+        || message.includes('streaming request');
+}
+
+function shouldForceBufferedAttachmentUpload(): boolean {
+    // Firefox has inconsistent behavior with encrypted stream upload + OpenPGP stream output.
+    // Use buffered mode there for reliability.
+    return /firefox/i.test(navigator.userAgent);
+}
+
 async function doSend() {
     const content = messageInput.value.trim();
     if (!content || !activeConversationId) return;
@@ -1403,39 +1705,21 @@ async function doSend() {
     messageInput.value = '';
     messageInput.style.height = 'auto';
     sendBtn.disabled = true;
+    attachBtn.disabled = true;
 
     try {
-        let payload: string;
-        let url: string;
-
         if (activeConversationType === 'group') {
-            if (!activeGroupKeyring.length) throw new Error('No encryption keys available for this group.');
-            const myKey = pgpPublicKey();
-            // Include current user's own key so they can decrypt their own messages
-            const allKeys = myKey ? [...activeGroupKeyring, myKey] : activeGroupKeyring;
-            payload = await encryptGroupMessage(content, allKeys);
-            url = `/group/${activeConversationId}/messages`;
-        } else {
-            if (!activeReceiverPublicKey) throw new Error('Cannot send message: recipient public key is unavailable.');
-            const myKey = pgpPublicKey();
-            if (!myKey) throw new Error('Encryption keys not loaded. Please unlock encryption first.');
-            payload = await encryptChatMessage(content, activeReceiverPublicKey, myKey);
-            url = `/chat/${activeConversationId}/messages`;
+            // Surface a user-friendly keyring error before OpenPGP throws a generic parse error.
+            getAttachmentEncryptionKeys();
         }
-
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: payload }),
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.message);
+        await sendEncryptedMessage(content);
         // WebSocket push will deliver the message to all participants in real time
     } catch (err: any) {
         messageInput.value = content; // restore on failure
         alert(err.message);
     } finally {
         sendBtn.disabled = false;
+        attachBtn.disabled = false;
         messageInput.focus();
     }
 }
@@ -1453,6 +1737,102 @@ messageInput.addEventListener('keydown', (e) => {
 messageInput.addEventListener('input', () => {
     messageInput.style.height = 'auto';
     messageInput.style.height = messageInput.scrollHeight + 'px';
+});
+
+attachBtn.onclick = () => {
+    if (!activeConversationId) return;
+    attachmentInput.click();
+};
+
+attachmentInput.addEventListener('change', async () => {
+    const file = attachmentInput.files?.[0];
+    attachmentInput.value = '';
+    if (!file || !activeConversationId) return;
+
+    if (file.size <= 0) {
+        alert('Cannot upload an empty file.');
+        return;
+    }
+    if (file.size > MAX_CHAT_ATTACHMENT_SIZE_BYTES) {
+        alert('File exceeds 5GB maximum size.');
+        return;
+    }
+
+    const originalText = messageInput.value;
+    const caption = messageInput.value.trim();
+
+    sendBtn.disabled = true;
+    attachBtn.disabled = true;
+    messageInput.disabled = true;
+
+    try {
+        const encryptionKeys = getAttachmentEncryptionKeys();
+
+        const uploadUrl = activeConversationType === 'group'
+            ? `/group/${activeConversationId}/attachments/upload`
+            : `/chat/${activeConversationId}/attachments/upload`;
+
+        const uploadHeaders = {
+            'Content-Type': 'application/octet-stream',
+            'X-File-Name': encodeURIComponent(file.name),
+            'X-File-Mime': file.type || 'application/octet-stream',
+            'X-File-Size': String(file.size),
+        };
+
+        let uploadRes: Response;
+        if (shouldForceBufferedAttachmentUpload()) {
+            const fileBytes = new Uint8Array(await file.arrayBuffer());
+            const encryptedBytes = await encryptBinaryForKeys(fileBytes, encryptionKeys);
+            uploadRes = await fetch(uploadUrl, {
+                method: 'POST',
+                headers: uploadHeaders,
+                body: encryptedBytes,
+            });
+        } else {
+            try {
+                const sourceStream = file.stream();
+                const encryptedStream = await encryptBinaryStreamForKeys(sourceStream, encryptionKeys);
+                uploadRes = await fetch(uploadUrl, {
+                    method: 'POST',
+                    headers: uploadHeaders,
+                    body: encryptedStream,
+                    // Required by some fetch implementations for streaming request bodies.
+                    duplex: 'half',
+                } as RequestInit & { duplex: 'half' });
+            } catch (streamErr) {
+                if (!isStreamingFetchTransportError(streamErr)) {
+                    throw streamErr;
+                }
+
+                // Fallback for browsers/runtimes that do not support streaming uploads.
+                const fileBytes = new Uint8Array(await file.arrayBuffer());
+                const encryptedBytes = await encryptBinaryForKeys(fileBytes, encryptionKeys);
+                uploadRes = await fetch(uploadUrl, {
+                    method: 'POST',
+                    headers: uploadHeaders,
+                    body: encryptedBytes,
+                });
+            }
+        }
+
+        const uploadData = await uploadRes.json();
+        if (!uploadData.success) throw new Error(uploadData.message);
+
+        if (caption) {
+            messageInput.value = '';
+            messageInput.style.height = 'auto';
+        }
+
+        await sendEncryptedMessage(caption, uploadData.attachment);
+    } catch (err: any) {
+        messageInput.value = originalText;
+        alert(err.message ?? 'Failed to upload attachment.');
+    } finally {
+        messageInput.disabled = false;
+        sendBtn.disabled = false;
+        attachBtn.disabled = false;
+        messageInput.focus();
+    }
 });
 
 // ── Delete message ────────────────────────────────────────────────────────────
@@ -1711,11 +2091,15 @@ function closeActiveConversation() {
     messagesContainer.innerHTML = '<div id="messagesPlaceholder" class="m-auto text-base-content/30 text-sm select-none">Open a conversation to start chatting</div>';
     messageInput.disabled = true;
     sendBtn.disabled = true;
+    attachBtn.disabled = true;
     sendChatPresence('close');
 }
 
 window.addEventListener('beforeunload', () => {
     sendChatPresence('close');
+    for (const entry of decryptedAttachmentCache.values()) {
+        URL.revokeObjectURL(entry.objectUrl);
+    }
 });
 
 closeChatDeleteBtn.onclick = () => doCloseChat(true);

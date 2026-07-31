@@ -138,6 +138,26 @@ describe('MessageModel', () => {
     const msg = await MessageModel.create({ conversationId: convId, senderId, content: 'Hi' });
     expect(msg.deletedAt).toBeNull();
   });
+
+  it('stores attachment metadata when provided', async () => {
+    const attachmentId = new mongoose.Types.ObjectId();
+    const msg = await MessageModel.create({
+      conversationId: convId,
+      senderId,
+      content: '[Attachment]',
+      attachment: {
+        fileId: attachmentId,
+        fileName: 'archive.zip',
+        mimeType: 'application/zip',
+        sizeBytes: 2048,
+        encryptedSizeBytes: 4096,
+      },
+    });
+
+    expect((msg as any).attachment.fileId.toString()).toBe(attachmentId.toString());
+    expect((msg as any).attachment.fileName).toBe('archive.zip');
+    expect((msg as any).attachment.encryptedSizeBytes).toBe(4096);
+  });
 });
 
 // ── FriendRequestModel ────────────────────────────────────────────────────────

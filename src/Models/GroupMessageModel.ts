@@ -17,6 +17,16 @@ const groupMessageSchema = new mongoose.Schema({
         type: String,
         required: true,
     },
+    attachment: {
+        type: {
+            fileId: { type: mongoose.Schema.Types.ObjectId, required: true },
+            fileName: { type: String, required: true },
+            mimeType: { type: String, required: true },
+            sizeBytes: { type: Number, required: true },
+            encryptedSizeBytes: { type: Number, required: true },
+        },
+        default: null,
+    },
 
     deletedAt: {
         type: Date,
