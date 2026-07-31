@@ -22,6 +22,7 @@ KeepQuiet is a self-hostable, end-to-end encrypted messaging application. All en
 - **Message deletion** — soft-delete individual messages; deleted messages show a placeholder to all participants
 - **Emoji reactions (DMs + groups)** — react to individual messages with emoji chips, live counts, and one-tap toggles in real time
 - **Read receipts (DMs + groups)** — sent messages show delivery/read state; DMs use checkmarks and groups show per-reader chips with timestamps
+- **Encrypted file sharing (DMs + groups)** — attach files up to 5GB, encrypt in-browser with recipient/group public keys, store encrypted bytes in MongoDB GridFS, and decrypt client-side for download/preview
 - **Chat usability improvements** — scrollable message pane with stable auto-scroll behavior for incoming messages
 - **Dashboard** — logged-in users see a summary of stats (friend count, messages sent, unread notifications, pending requests), quick-action buttons, and an inline accept/decline panel for incoming friend requests
 - **Profile page** — displays your username, member-since date, and your full ASCII-armored PGP public key with a one-click copy-to-clipboard button
@@ -61,6 +62,21 @@ KeepQuiet uses a **PGP challenge-response** flow instead of passwords:
 - Both DMs and groups support emoji reactions with live count updates.
 - You can soft-delete any message you sent.
 - You can close a conversation (hide it from your sidebar). When closing, you are prompted to either keep the messages or permanently delete them. Opening a new chat with the same friend restores the conversation.
+
+### File Sharing
+- Attachments are encrypted in the browser before upload; the server only receives encrypted bytes.
+- Maximum file size is **5GB** (validated client-side and server-side).
+- Encrypted bytes are stored in MongoDB **GridFS** (`chat_attachments` bucket).
+- A message stores attachment metadata (file id, name, mime type, plaintext size, encrypted size) and can optionally include a text caption.
+- Attachment downloads require two checks:
+   - the requester is a member of the DM/group
+   - the attachment is still referenced by at least one non-deleted message
+- Decrypt and preview happen fully client-side using the private key already loaded in the unlock flow.
+- Orphaned files are cleaned up automatically when attachments are no longer referenced (message/group/member deletion paths).
+- Browser compatibility:
+   - Chrome/Chromium browsers use streaming encryption/upload when available.
+   - Firefox uses buffered encryption/upload by design for reliability.
+   - Any streaming transport failure falls back to buffered upload automatically.
 
 ### Friends
 - Users find each other by sharing their PGP public key.
@@ -203,6 +219,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `conversationId` | ObjectId | references Conversation |
 | `senderId` | ObjectId | references User |
 | `content` | string | PGP-encrypted ciphertext |
+| `attachment` | `{ fileId: ObjectId, fileName: string, mimeType: string, sizeBytes: number, encryptedSizeBytes: number } \| null` | optional encrypted attachment reference |
 | `deletedAt` | datetime | set when soft-deleted; `null` otherwise |
 | `readBy` | `{ userId: ObjectId, readAt: datetime }[]` | users who have read this message |
 | `reactions` | `{ emoji: string, users: ObjectId[] }[]` | reaction buckets keyed by emoji |
@@ -244,6 +261,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `groupId` | ObjectId | references GroupConversation |
 | `senderId` | ObjectId | references User |
 | `content` | string | PGP-encrypted ciphertext (encrypted for every member's key) |
+| `attachment` | `{ fileId: ObjectId, fileName: string, mimeType: string, sizeBytes: number, encryptedSizeBytes: number } \| null` | optional encrypted attachment reference |
 | `deletedAt` | datetime | set when soft-deleted; `null` otherwise |
 | `readBy` | `{ userId: ObjectId, readAt: datetime }[]` | members who have read this message |
 | `reactions` | `{ emoji: string, users: ObjectId[] }[]` | reaction buckets keyed by emoji |
@@ -294,6 +312,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `POST` | `/chat/start` | Get or create a conversation with a friend |
 | `GET` | `/chat/:conversationId/messages` | Load messages for a conversation |
 | `POST` | `/chat/:conversationId/read` | Mark all unread messages in a conversation as read (current user) |
+| `POST` | `/chat/:conversationId/attachments/upload` | Upload encrypted attachment bytes for a DM (GridFS) |
 | `POST` | `/chat/:conversationId/messages` | Send a message |
 | `DELETE` | `/chat/:conversationId/messages/:messageId` | Soft-delete a message |
 | `POST` | `/chat/:conversationId/messages/:messageId/reactions` | Toggle an emoji reaction on a DM message |
@@ -301,6 +320,11 @@ Connections that miss two consecutive pings are terminated automatically.
 | `POST` | `/chat/:conversationId/mute` | Toggle mute for a conversation |
 | `DELETE` | `/chat/:conversationId` | Close (and optionally delete messages in) a conversation |
 | `GET` | `/chat/:conversationId/recipient-key` | Fetch the recipient's public key for encryption |
+
+### Attachments
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/attachments/:attachmentId` | Download encrypted attachment bytes (authorization + live-reference checks) |
 
 ### Notifications
 | Method | Path | Description |
@@ -319,6 +343,7 @@ Connections that miss two consecutive pings are terminated automatically.
 | `GET` | `/group/:groupId/keyring` | Get the array of armored public keys for all members |
 | `GET` | `/group/:groupId/messages` | Load messages for a group |
 | `POST` | `/group/:groupId/read` | Mark all unread messages in a group as read (current user) |
+| `POST` | `/group/:groupId/attachments/upload` | Upload encrypted attachment bytes for a group (GridFS) |
 | `POST` | `/group/:groupId/messages` | Send a message to a group |
 | `DELETE` | `/group/:groupId/messages/:messageId` | Soft-delete a group message (sender only) |
 | `POST` | `/group/:groupId/messages/:messageId/reactions` | Toggle an emoji reaction on a group message |
@@ -379,7 +404,7 @@ There are no separate REST call routes; call state is synchronized via the event
 - ~~**Group chats** — multi-participant conversations with shared group key management up to 10 people~~
 - ~~**Message reactions** — emoji reactions on individual messages~~
 - ~~**Read receipts** — show when a message has been seen by the recipient~~
-- **File / image sharing** — encrypted attachment support
+- ~~**File / image sharing** — encrypted attachment support~~
 - **Notification preferences** — advanced controls (quiet hours, mention-only rules, per-device behavior)
 - ~~**E2EE Voice & Video Chat** — E2EE Voice & Video Chat for 10 people~~
 - ~~**Call invites + timeout handling** — incoming call modal, accept/decline, missed/expired statuses~~
@@ -391,6 +416,7 @@ There are no separate REST call routes; call state is synchronized via the event
 ## Tests Added
 
 - Added call signaling lifecycle coverage in `src/Tests/callsignaling.test.ts`.
+- Added encrypted attachment route integration coverage in `src/Tests/chat-attachments.routes.test.ts`.
 - Covered scenarios:
    - authorized invite delivery
    - accept flow on join
@@ -398,6 +424,9 @@ There are no separate REST call routes; call state is synchronized via the event
    - invite timeout -> missed/expired events
    - signaling relay authorization
    - leave notifications
+   - attachment upload authorization
+   - attachment download authorization
+   - orphaned GridFS cleanup after message deletion
 
 ---
 

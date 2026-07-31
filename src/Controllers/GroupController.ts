@@ -3,6 +3,47 @@ import GroupConversationModel from "../Models/GroupConversationModel";
 import GroupMessageModel from "../Models/GroupMessageModel";
 import UserModel from "../Models/UserModel";
 
+interface MessageAttachmentInput {
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    encryptedSizeBytes: number;
+}
+
+const ATTACHMENT_PLACEHOLDER_CONTENT = "[Attachment]";
+
+function normalizeAttachment(attachment?: MessageAttachmentInput) {
+    if (!attachment) return null;
+    const {
+        attachmentId,
+        fileName,
+        mimeType,
+        sizeBytes,
+        encryptedSizeBytes,
+    } = attachment;
+
+    if (!mongoose.Types.ObjectId.isValid(attachmentId)) {
+        throw new Error("Invalid attachment id.");
+    }
+    if (!fileName?.trim()) throw new Error("Attachment fileName is required.");
+    if (!mimeType?.trim()) throw new Error("Attachment mimeType is required.");
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+        throw new Error("Attachment sizeBytes must be a positive number.");
+    }
+    if (!Number.isFinite(encryptedSizeBytes) || encryptedSizeBytes <= 0) {
+        throw new Error("Attachment encryptedSizeBytes must be a positive number.");
+    }
+
+    return {
+        fileId: new mongoose.Types.ObjectId(attachmentId),
+        fileName: fileName.trim(),
+        mimeType: mimeType.trim(),
+        sizeBytes,
+        encryptedSizeBytes,
+    };
+}
+
 class GroupController {
     /**
      * Create a new group conversation.
@@ -71,11 +112,44 @@ class GroupController {
         const gid = new mongoose.Types.ObjectId(groupId);
         const uid = new mongoose.Types.ObjectId(userId);
 
-        const group = await GroupConversationModel.findById(gid).lean();
+        const group = await GroupConversationModel.findById(gid);
         if (!group) throw new Error("Group not found.");
 
         const isMember = (group.members as any[]).some((m: any) => m.userId.equals(uid));
         if (!isMember) throw new Error("Unauthorized.");
+
+        const memberIds = (group.members as any[]).map((m: any) => m.userId);
+        const users = await UserModel.find({ _id: { $in: memberIds } }, 'publicKeyArmored username').lean();
+        const userById = new Map(users.map((u: any) => [u._id.toString(), u]));
+
+        const missingOrInvalid: string[] = [];
+        let changed = false;
+
+        for (const member of group.members as any[]) {
+            const user = userById.get(member.userId.toString());
+            const key = user?.publicKeyArmored;
+            const looksArmored = typeof key === 'string'
+                && key.includes('-----BEGIN PGP PUBLIC KEY BLOCK-----')
+                && key.includes('-----END PGP PUBLIC KEY BLOCK-----');
+
+            if (!looksArmored) {
+                missingOrInvalid.push(user?.username ?? member.userId.toString());
+                continue;
+            }
+
+            if (member.publicKeyArmored !== key) {
+                member.publicKeyArmored = key;
+                changed = true;
+            }
+        }
+
+        if (missingOrInvalid.length > 0) {
+            throw new Error(`Some members have invalid or missing PGP keys: ${missingOrInvalid.join(', ')}`);
+        }
+
+        if (changed) {
+            await group.save();
+        }
 
         return (group.members as any[]).map((m: any) => m.publicKeyArmored as string);
     }
@@ -124,8 +198,17 @@ class GroupController {
     }
 
     /** Send a message to a group — must be a member. */
-    async sendMessage(groupId: string, senderId: string, content: string) {
-        if (!content?.trim()) throw new Error("Message content cannot be empty.");
+    async sendMessage(
+        groupId: string,
+        senderId: string,
+        content: string,
+        attachment?: MessageAttachmentInput,
+    ) {
+        const normalizedContent = content?.trim() ?? "";
+        const normalizedAttachment = normalizeAttachment(attachment);
+        if (!normalizedContent && !normalizedAttachment) {
+            throw new Error("Message content cannot be empty.");
+        }
 
         const gid = new mongoose.Types.ObjectId(groupId);
         const sid = new mongoose.Types.ObjectId(senderId);
@@ -139,7 +222,8 @@ class GroupController {
         const message = await GroupMessageModel.create({
             groupId: gid,
             senderId: sid,
-            content: content.trim(),
+            content: normalizedContent || ATTACHMENT_PLACEHOLDER_CONTENT,
+            attachment: normalizedAttachment,
         });
 
         group.lastMessageAt = new Date();
@@ -212,6 +296,14 @@ class GroupController {
 
         if (tid.equals(rid)) throw new Error("Admin cannot remove themselves — use leave instead.");
 
+        const messagesWithAttachments = await GroupMessageModel.find(
+            { groupId: gid, senderId: tid, deletedAt: null, attachment: { $ne: null } },
+            { 'attachment.fileId': 1 },
+        ).lean();
+        const deletedAttachmentIds = messagesWithAttachments
+            .map((m: any) => m?.attachment?.fileId?.toString())
+            .filter((id: string | undefined): id is string => !!id);
+
         // Soft-delete all messages by this member
         await GroupMessageModel.updateMany(
             { groupId: gid, senderId: tid, deletedAt: null },
@@ -222,6 +314,8 @@ class GroupController {
         await GroupConversationModel.findByIdAndUpdate(gid, {
             $pull: { members: { userId: tid } },
         });
+
+        return { deletedAttachmentIds };
     }
 
     /**
@@ -239,6 +333,14 @@ class GroupController {
         const isMember = (group.members as any[]).some((m: any) => m.userId.equals(uid));
         if (!isMember) throw new Error("You are not a member of this group.");
 
+        const messagesWithAttachments = await GroupMessageModel.find(
+            { groupId: gid, senderId: uid, deletedAt: null, attachment: { $ne: null } },
+            { 'attachment.fileId': 1 },
+        ).lean();
+        const deletedAttachmentIds = messagesWithAttachments
+            .map((m: any) => m?.attachment?.fileId?.toString())
+            .filter((id: string | undefined): id is string => !!id);
+
         // Soft-delete all messages by this user
         await GroupMessageModel.updateMany(
             { groupId: gid, senderId: uid, deletedAt: null },
@@ -252,7 +354,7 @@ class GroupController {
             // Last person leaving — delete the group
             await GroupConversationModel.findByIdAndDelete(gid);
             await GroupMessageModel.deleteMany({ groupId: gid });
-            return;
+            return { deletedAttachmentIds };
         }
 
         const update: any = { $pull: { members: { userId: uid } } };
@@ -263,6 +365,7 @@ class GroupController {
         }
 
         await GroupConversationModel.findByIdAndUpdate(gid, update);
+        return { deletedAttachmentIds };
     }
 
     /**
@@ -277,8 +380,17 @@ class GroupController {
         if (!group) throw new Error("Group not found.");
         if (!(group.adminId as any).equals(uid)) throw new Error("Only the group admin can delete the group.");
 
+        const messagesWithAttachments = await GroupMessageModel.find(
+            { groupId: gid, attachment: { $ne: null } },
+            { 'attachment.fileId': 1 },
+        ).lean();
+        const deletedAttachmentIds = messagesWithAttachments
+            .map((m: any) => m?.attachment?.fileId?.toString())
+            .filter((id: string | undefined): id is string => !!id);
+
         await GroupMessageModel.deleteMany({ groupId: gid });
         await GroupConversationModel.findByIdAndDelete(gid);
+        return { deletedAttachmentIds };
     }
 
     /**

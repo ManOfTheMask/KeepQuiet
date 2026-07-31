@@ -23,6 +23,8 @@ import session from 'express-session';
 import openpgp from 'openpgp'; // Import OpenPGP for cryptographic operations
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
+import { Transform } from 'stream';
+import { GridFSBucket, ObjectId } from 'mongodb';
 
 type CallRoomType = 'dm' | 'group';
 
@@ -116,6 +118,214 @@ if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDEN
 }
 
 const ICE_SERVERS_JSON = JSON.stringify(ICE_SERVERS);
+
+type ConversationScopeType = 'dm' | 'group';
+
+interface ChatAttachmentPayload {
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    encryptedSizeBytes: number;
+}
+
+interface UploadAttachmentHeaders {
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+}
+
+const ATTACHMENT_BUCKET_NAME = 'chat_attachments';
+const MAX_ATTACHMENT_SIZE_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_ENCRYPTED_ATTACHMENT_SIZE_BYTES = MAX_ATTACHMENT_SIZE_BYTES + (32 * 1024 * 1024);
+
+function getAttachmentBucket(): GridFSBucket {
+    const db = mongoose.connection.db;
+    if (!db) throw new Error('Database is not ready. Please retry.');
+    return new GridFSBucket(db, { bucketName: ATTACHMENT_BUCKET_NAME });
+}
+
+function safeAttachmentFilename(fileName: string): string {
+    const cleaned = fileName
+        .replace(/[\r\n]/g, ' ')
+        .replace(/[\\/]/g, '_')
+        .trim();
+    if (!cleaned) return 'attachment.bin';
+    return cleaned.slice(0, 255);
+}
+
+function parseAttachmentUploadHeaders(req: Request): UploadAttachmentHeaders {
+    const rawName = req.header('x-file-name');
+    const rawMime = req.header('x-file-mime');
+    const rawSize = req.header('x-file-size');
+
+    if (!rawName || !rawSize) {
+        throw new Error('Attachment headers x-file-name and x-file-size are required.');
+    }
+
+    let decodedName = rawName;
+    try {
+        decodedName = decodeURIComponent(rawName);
+    } catch {
+        decodedName = rawName;
+    }
+
+    const sizeBytes = Number(rawSize);
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+        throw new Error('x-file-size must be a positive number.');
+    }
+    if (sizeBytes > MAX_ATTACHMENT_SIZE_BYTES) {
+        throw new Error('File size exceeds the 5GB limit.');
+    }
+
+    return {
+        fileName: safeAttachmentFilename(decodedName),
+        mimeType: (rawMime?.trim() || 'application/octet-stream').slice(0, 200),
+        sizeBytes,
+    };
+}
+
+function serializeAttachment(attachment: any): ChatAttachmentPayload | null {
+    if (!attachment?.fileId) return null;
+    return {
+        attachmentId: attachment.fileId.toString(),
+        fileName: attachment.fileName,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.sizeBytes,
+        encryptedSizeBytes: attachment.encryptedSizeBytes,
+    };
+}
+
+async function findLiveAttachmentReference(fileId: ObjectId): Promise<{ conversationType: ConversationScopeType; conversationId: string } | null> {
+    const dmReference = await MessageModel.findOne(
+        { 'attachment.fileId': fileId, deletedAt: null },
+        { conversationId: 1 },
+    ).lean();
+    if (dmReference?.conversationId) {
+        return { conversationType: 'dm', conversationId: dmReference.conversationId.toString() };
+    }
+
+    const groupReference = await GroupMessageModel.findOne(
+        { 'attachment.fileId': fileId, deletedAt: null },
+        { groupId: 1 },
+    ).lean();
+    if (groupReference?.groupId) {
+        return { conversationType: 'group', conversationId: groupReference.groupId.toString() };
+    }
+
+    return null;
+}
+
+async function cleanupAttachmentIfOrphaned(fileId: string | ObjectId): Promise<void> {
+    const objectId = typeof fileId === 'string' ? new ObjectId(fileId) : fileId;
+    const liveReference = await findLiveAttachmentReference(objectId);
+    if (liveReference) return;
+
+    const bucket = getAttachmentBucket();
+    try {
+        await bucket.delete(objectId);
+    } catch {
+        // Ignore missing files or race conditions where another cleanup already removed the blob.
+    }
+}
+
+async function cleanupAttachmentsIfOrphaned(fileIds: Array<string | ObjectId | null | undefined>): Promise<void> {
+    const uniqueIds = Array.from(new Set(
+        fileIds
+            .map((id) => (id ? id.toString() : null))
+            .filter((id): id is string => !!id),
+    ));
+
+    for (const id of uniqueIds) {
+        if (!ObjectId.isValid(id)) continue;
+        await cleanupAttachmentIfOrphaned(new ObjectId(id));
+    }
+}
+
+async function isUserAuthorizedForConversationScope(
+    userId: string,
+    conversationType: ConversationScopeType,
+    conversationId: string,
+): Promise<boolean> {
+    if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(conversationId)) {
+        return false;
+    }
+
+    const uid = new mongoose.Types.ObjectId(userId);
+    const cid = new mongoose.Types.ObjectId(conversationId);
+
+    if (conversationType === 'dm') {
+        const conv = await ConversationModel.findById(cid).lean();
+        if (!conv) return false;
+        return (conv.participants as any[]).some((p: any) => p.equals(uid));
+    }
+
+    const group = await GroupConversationModel.findById(cid).lean();
+    if (!group) return false;
+    return (group.members as any[]).some((m: any) => m.userId.equals(uid));
+}
+
+async function uploadEncryptedAttachmentToGridFS(
+    req: Request,
+    senderId: string,
+    conversationType: ConversationScopeType,
+    conversationId: string,
+    headers: UploadAttachmentHeaders,
+): Promise<ChatAttachmentPayload> {
+    const bucket = getAttachmentBucket();
+
+    const uploadStream = bucket.openUploadStream(headers.fileName, {
+        contentType: 'application/octet-stream',
+        metadata: {
+            senderId,
+            conversationType,
+            conversationId,
+            originalFileName: headers.fileName,
+            originalMimeType: headers.mimeType,
+            originalSize: headers.sizeBytes,
+            encrypted: true,
+        },
+    });
+
+    let encryptedSizeBytes = 0;
+    const sizeLimiter = new Transform({
+        transform(chunk, _enc, callback) {
+            encryptedSizeBytes += chunk.length;
+            if (encryptedSizeBytes > MAX_ENCRYPTED_ATTACHMENT_SIZE_BYTES) {
+                callback(new Error('Encrypted payload exceeds the allowed size limit.'));
+                return;
+            }
+            callback(null, chunk);
+        },
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        const fail = (err: Error) => {
+            sizeLimiter.destroy(err);
+            uploadStream.destroy(err);
+            reject(err);
+        };
+
+        req.on('error', fail);
+        sizeLimiter.on('error', fail);
+        uploadStream.on('error', fail);
+        uploadStream.on('finish', () => resolve());
+
+        req.pipe(sizeLimiter).pipe(uploadStream);
+    });
+
+    if (encryptedSizeBytes === 0) {
+        throw new Error('Attachment body is empty.');
+    }
+
+    return {
+        attachmentId: uploadStream.id.toString(),
+        fileName: headers.fileName,
+        mimeType: headers.mimeType,
+        sizeBytes: headers.sizeBytes,
+        encryptedSizeBytes,
+    };
+}
 
 // ── WebSocket helpers ──────────────────────────────────────────────────────────
 const connectedUsers = new Map<string, Set<WebSocket>>();
@@ -1063,8 +1273,36 @@ app.get('/chat/:conversationId/messages', requireAuth, async (req: Request, res:
                 emoji: r.emoji,
                 users: (r.users ?? []).map((uid: any) => uid.toString()),
             })),
+            attachment: serializeAttachment(m.attachment),
         }));
         res.json({ success: true, messages: serialized });
+    } catch (error: any) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+// Upload an encrypted attachment for a DM conversation (client-side encrypted before upload)
+app.post('/chat/:conversationId/attachments/upload', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const userId = req.session.userId!;
+        const conversationId = req.params.conversationId;
+
+        const isAllowed = await isUserAuthorizedForConversationScope(userId, 'dm', conversationId);
+        if (!isAllowed) {
+            res.status(403).json({ success: false, message: 'Unauthorized.' });
+            return;
+        }
+
+        const headers = parseAttachmentUploadHeaders(req);
+        const attachment = await uploadEncryptedAttachmentToGridFS(
+            req,
+            userId,
+            'dm',
+            conversationId,
+            headers,
+        );
+
+        res.json({ success: true, attachment });
     } catch (error: any) {
         res.status(400).json({ success: false, message: error.message });
     }
@@ -1098,16 +1336,17 @@ app.post('/chat/:conversationId/read', requireAuth, async (req: Request, res: Re
 
 // Send a message
 app.post('/chat/:conversationId/messages', requireAuth, async (req: Request, res: Response) => {
-    const { content } = req.body;
-    if (!content) {
-        res.status(400).json({ success: false, message: 'content is required.' });
+    const { content, attachment } = req.body;
+    if (!content && !attachment) {
+        res.status(400).json({ success: false, message: 'content or attachment is required.' });
         return;
     }
     try {
         const message = await ChatController.sendMessage(
             req.params.conversationId,
             req.session.userId!,
-            content
+            typeof content === 'string' ? content : '',
+            attachment,
         );
 
         // Broadcast new message to all participants via WebSocket
@@ -1121,12 +1360,13 @@ app.post('/chat/:conversationId/messages', requireAuth, async (req: Request, res
                     id: message._id.toString(),
                     senderUsername: sender.username,
                     senderId: req.session.userId!,
-                    content,
+                    content: (message as any).content,
                     deleted: false,
                     createdAt: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                     createdAtMs: new Date(message.createdAt).getTime(),
                     readBy: [],
                     reactions: [],
+                    attachment: serializeAttachment((message as any).attachment),
                 },
             };
             for (const participantId of conv.participants as any[]) {
@@ -1175,7 +1415,7 @@ app.post('/chat/:conversationId/messages', requireAuth, async (req: Request, res
 // Soft-delete a message
 app.delete('/chat/:conversationId/messages/:messageId', requireAuth, async (req: Request, res: Response) => {
     try {
-        await ChatController.deleteMessage(req.params.messageId, req.session.userId!);
+        const deletedMessage = await ChatController.deleteMessage(req.params.messageId, req.session.userId!);
 
         // Broadcast deletion to all participants via WebSocket
         const conv = await ConversationModel.findById(req.params.conversationId);
@@ -1189,6 +1429,8 @@ app.delete('/chat/:conversationId/messages/:messageId', requireAuth, async (req:
                 broadcastToUser(participantId.toString(), wsMsg);
             }
         }
+
+        await cleanupAttachmentsIfOrphaned([(deletedMessage as any).attachment?.fileId]);
 
         res.json({ success: true });
     } catch (error: any) {
@@ -1261,11 +1503,14 @@ app.post('/chat/:conversationId/mute', requireAuth, async (req: Request, res: Re
 app.delete('/chat/:conversationId', requireAuth, async (req: Request, res: Response) => {
     try {
         const deleteMessages = req.body.deleteMessages === true;
-        await ChatController.closeConversation(
+        const result = await ChatController.closeConversation(
             req.params.conversationId,
             req.session.userId!,
             deleteMessages,
         );
+        if (deleteMessages) {
+            await cleanupAttachmentsIfOrphaned((result as any).deletedAttachmentIds ?? []);
+        }
         res.json({ success: true });
     } catch (error: any) {
         res.status(400).json({ success: false, message: error.message });
@@ -1568,10 +1813,38 @@ app.get('/group/:groupId/messages', requireAuth, async (req: Request, res: Respo
                 emoji: r.emoji,
                 users: (r.users ?? []).map((uid: any) => uid.toString()),
             })),
+            attachment: serializeAttachment(m.attachment),
         }));
         res.json({ success: true, messages: serialized });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
+    }
+});
+
+// Upload an encrypted attachment for a group conversation (client-side encrypted before upload)
+app.post('/group/:groupId/attachments/upload', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const userId = req.session.userId!;
+        const groupId = req.params.groupId;
+
+        const isAllowed = await isUserAuthorizedForConversationScope(userId, 'group', groupId);
+        if (!isAllowed) {
+            res.status(403).json({ success: false, message: 'Unauthorized.' });
+            return;
+        }
+
+        const headers = parseAttachmentUploadHeaders(req);
+        const attachment = await uploadEncryptedAttachmentToGridFS(
+            req,
+            userId,
+            'group',
+            groupId,
+            headers,
+        );
+
+        res.json({ success: true, attachment });
+    } catch (error: any) {
+        res.status(400).json({ success: false, message: error.message });
     }
 });
 
@@ -1603,13 +1876,18 @@ app.post('/group/:groupId/read', requireAuth, async (req: Request, res: Response
 
 // Send a message to a group
 app.post('/group/:groupId/messages', requireAuth, async (req: Request, res: Response) => {
-    const { content } = req.body;
-    if (!content) {
-        res.status(400).json({ success: false, message: 'content is required.' });
+    const { content, attachment } = req.body;
+    if (!content && !attachment) {
+        res.status(400).json({ success: false, message: 'content or attachment is required.' });
         return;
     }
     try {
-        const message = await GroupController.sendMessage(req.params.groupId, req.session.userId!, content);
+        const message = await GroupController.sendMessage(
+            req.params.groupId,
+            req.session.userId!,
+            typeof content === 'string' ? content : '',
+            attachment,
+        );
         const sender = await UserController.getUserById(req.session.userId!);
         const group = await GroupConversationModel.findById(req.params.groupId);
 
@@ -1621,12 +1899,13 @@ app.post('/group/:groupId/messages', requireAuth, async (req: Request, res: Resp
                     id: message._id.toString(),
                     senderUsername: sender.username,
                     senderId: req.session.userId!,
-                    content,
+                    content: (message as any).content,
                     deleted: false,
                     createdAt: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                     createdAtMs: new Date(message.createdAt).getTime(),
                     readBy: [],
                     reactions: [],
+                    attachment: serializeAttachment((message as any).attachment),
                 },
             };
             for (const m of group.members as any[]) {
@@ -1675,7 +1954,7 @@ app.post('/group/:groupId/messages', requireAuth, async (req: Request, res: Resp
 // Soft-delete a group message
 app.delete('/group/:groupId/messages/:messageId', requireAuth, async (req: Request, res: Response) => {
     try {
-        await GroupController.deleteMessage(req.params.messageId, req.session.userId!);
+        const deletedMessage = await GroupController.deleteMessage(req.params.messageId, req.session.userId!);
         const group = await GroupConversationModel.findById(req.params.groupId);
         if (group) {
             const wsMsg = {
@@ -1687,6 +1966,7 @@ app.delete('/group/:groupId/messages/:messageId', requireAuth, async (req: Reque
                 broadcastToUser(m.userId.toString(), wsMsg);
             }
         }
+        await cleanupAttachmentsIfOrphaned([(deletedMessage as any).attachment?.fileId]);
         res.json({ success: true });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
@@ -1774,7 +2054,7 @@ app.post('/group/:groupId/invite', requireAuth, async (req: Request, res: Respon
 // Remove a member — admin only
 app.delete('/group/:groupId/members/:memberId', requireAuth, async (req: Request, res: Response) => {
     try {
-        await GroupController.removeMember(req.params.groupId, req.session.userId!, req.params.memberId);
+        const result = await GroupController.removeMember(req.params.groupId, req.session.userId!, req.params.memberId);
         const group = await GroupConversationModel.findById(req.params.groupId).lean();
         const wsMsg = {
             type: 'group_member_removed',
@@ -1787,6 +2067,7 @@ app.delete('/group/:groupId/members/:memberId', requireAuth, async (req: Request
             }
         }
         broadcastToUser(req.params.memberId, wsMsg);
+        await cleanupAttachmentsIfOrphaned((result as any).deletedAttachmentIds ?? []);
         res.json({ success: true });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
@@ -1798,7 +2079,7 @@ app.post('/group/:groupId/leave', requireAuth, async (req: Request, res: Respons
     try {
         // Capture members before leave so we can broadcast to all of them
         const groupBefore = await GroupConversationModel.findById(req.params.groupId).lean();
-        await GroupController.leaveGroup(req.params.groupId, req.session.userId!);
+        const result = await GroupController.leaveGroup(req.params.groupId, req.session.userId!);
 
         if (groupBefore) {
             const wsMsg = {
@@ -1810,6 +2091,7 @@ app.post('/group/:groupId/leave', requireAuth, async (req: Request, res: Respons
                 broadcastToUser(m.userId.toString(), wsMsg);
             }
         }
+        await cleanupAttachmentsIfOrphaned((result as any).deletedAttachmentIds ?? []);
         res.json({ success: true });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
@@ -1840,7 +2122,7 @@ app.post('/group/:groupId/mute', requireAuth, async (req: Request, res: Response
 app.delete('/group/:groupId', requireAuth, async (req: Request, res: Response) => {
     try {
         const group = await GroupConversationModel.findById(req.params.groupId).lean();
-        await GroupController.deleteGroup(req.params.groupId, req.session.userId!);
+        const result = await GroupController.deleteGroup(req.params.groupId, req.session.userId!);
 
         if (group) {
             const wsMsg = { type: 'group_deleted', groupId: req.params.groupId };
@@ -1848,6 +2130,7 @@ app.delete('/group/:groupId', requireAuth, async (req: Request, res: Response) =
                 broadcastToUser(m.userId.toString(), wsMsg);
             }
         }
+        await cleanupAttachmentsIfOrphaned((result as any).deletedAttachmentIds ?? []);
         res.json({ success: true });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
@@ -1869,6 +2152,82 @@ app.patch('/group/:groupId/name', requireAuth, async (req: Request, res: Respons
         res.json({ success: true, name: result.name });
     } catch (err: any) {
         res.status(400).json({ success: false, message: err.message });
+    }
+});
+
+// Download encrypted attachment bytes (client decrypts with local private key)
+app.get('/attachments/:attachmentId', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const userId = req.session.userId!;
+        const attachmentId = req.params.attachmentId;
+
+        if (!ObjectId.isValid(attachmentId)) {
+            res.status(400).json({ success: false, message: 'Invalid attachment id.' });
+            return;
+        }
+
+        const bucket = getAttachmentBucket();
+        const fileId = new ObjectId(attachmentId);
+        const files = await bucket.find({ _id: fileId }).toArray();
+        if (!files.length) {
+            res.status(404).json({ success: false, message: 'Attachment not found.' });
+            return;
+        }
+
+        const file = files[0];
+        const metadata = (file.metadata ?? {}) as {
+            conversationType?: ConversationScopeType;
+            conversationId?: string;
+            originalFileName?: string;
+            originalMimeType?: string;
+            originalSize?: number;
+        };
+
+        const liveReference = await findLiveAttachmentReference(fileId);
+        if (!liveReference) {
+            await cleanupAttachmentIfOrphaned(fileId);
+            res.status(404).json({ success: false, message: 'Attachment not found.' });
+            return;
+        }
+
+        if (!metadata.conversationType || !metadata.conversationId) {
+            res.status(400).json({ success: false, message: 'Attachment metadata is invalid.' });
+            return;
+        }
+
+        if (metadata.conversationType !== liveReference.conversationType || metadata.conversationId !== liveReference.conversationId) {
+            res.status(400).json({ success: false, message: 'Attachment metadata mismatch.' });
+            return;
+        }
+
+        const isAllowed = await isUserAuthorizedForConversationScope(
+            userId,
+            metadata.conversationType,
+            metadata.conversationId,
+        );
+        if (!isAllowed) {
+            res.status(403).json({ success: false, message: 'Unauthorized.' });
+            return;
+        }
+
+        const safeName = safeAttachmentFilename(metadata.originalFileName ?? file.filename ?? 'attachment.bin');
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}.pgp"`);
+        res.setHeader('X-Attachment-Name', encodeURIComponent(safeName));
+        res.setHeader('X-Attachment-Mime', metadata.originalMimeType ?? 'application/octet-stream');
+        res.setHeader('X-Attachment-Size', String(metadata.originalSize ?? 0));
+
+        const downloadStream = bucket.openDownloadStream(fileId);
+        downloadStream.on('error', () => {
+            if (!res.headersSent) {
+                res.status(500).json({ success: false, message: 'Failed to stream attachment.' });
+            } else {
+                res.end();
+            }
+        });
+        downloadStream.pipe(res);
+    } catch (error: any) {
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 

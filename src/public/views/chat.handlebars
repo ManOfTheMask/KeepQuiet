@@ -164,6 +164,8 @@
 
                 <!-- Input bar -->
                 <div id="inputBar" class="bg-base-100 border-t border-base-300 p-3 sm:p-4 flex gap-3 items-end shrink-0">
+                    <input id="attachmentInput" type="file" class="hidden" />
+                    <button id="attachBtn" disabled class="btn btn-outline self-end disabled:opacity-40" title="Attach a file (up to 5GB)">+</button>
                     <textarea
                         id="messageInput"
                         rows="1"

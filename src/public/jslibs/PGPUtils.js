@@ -323,3 +323,116 @@ export async function decryptChatMessage(armoredMessage, privateKeyArmored, pass
     });
     return data;
 }
+
+/**
+ * Encrypts binary data to a set of recipients using armored public keys.
+ * Returns raw encrypted bytes suitable for upload/storage.
+ * @async
+ * @param {Uint8Array} binaryData
+ * @param {string[]} armoredPublicKeys
+ * @returns {Promise<Uint8Array>}
+ */
+export async function encryptBinaryForKeys(binaryData, armoredPublicKeys) {
+    if (!(binaryData instanceof Uint8Array) || binaryData.length === 0) {
+        throw new Error('Binary data is required for file encryption.');
+    }
+    if (!Array.isArray(armoredPublicKeys) || armoredPublicKeys.length === 0) {
+        throw new Error('At least one armored public key is required.');
+    }
+
+    const uniqueKeys = Array.from(new Set(
+        armoredPublicKeys
+            .filter((k) => typeof k === 'string' && k.trim().length > 0)
+            .map((k) => k.trim())
+    ));
+    if (uniqueKeys.length === 0) {
+        throw new Error('No valid armored public keys were provided.');
+    }
+
+    const encryptionKeys = await Promise.all(
+        uniqueKeys.map((armoredKey) => openpgp.readKey({ armoredKey }))
+    );
+
+    return await openpgp.encrypt({
+        message: await openpgp.createMessage({ binary: binaryData }),
+        encryptionKeys,
+        format: 'binary',
+    });
+}
+
+/**
+ * Encrypts a binary stream to recipients and returns an encrypted stream.
+ * Falls back to a one-chunk stream if OpenPGP returns a Uint8Array.
+ * @async
+ * @param {ReadableStream<Uint8Array>} binaryStream
+ * @param {string[]} armoredPublicKeys
+ * @returns {Promise<ReadableStream<Uint8Array>>}
+ */
+export async function encryptBinaryStreamForKeys(binaryStream, armoredPublicKeys) {
+    if (!binaryStream || typeof binaryStream.getReader !== 'function') {
+        throw new Error('A readable binary stream is required for streaming encryption.');
+    }
+    if (!Array.isArray(armoredPublicKeys) || armoredPublicKeys.length === 0) {
+        throw new Error('At least one armored public key is required.');
+    }
+
+    const uniqueKeys = Array.from(new Set(
+        armoredPublicKeys
+            .filter((k) => typeof k === 'string' && k.trim().length > 0)
+            .map((k) => k.trim())
+    ));
+    if (uniqueKeys.length === 0) {
+        throw new Error('No valid armored public keys were provided.');
+    }
+
+    const encryptionKeys = await Promise.all(
+        uniqueKeys.map((armoredKey) => openpgp.readKey({ armoredKey }))
+    );
+
+    const encrypted = await openpgp.encrypt({
+        message: await openpgp.createMessage({ binary: binaryStream }),
+        encryptionKeys,
+        format: 'binary',
+    });
+
+    if (encrypted instanceof Uint8Array) {
+        return new ReadableStream({
+            start(controller) {
+                controller.enqueue(encrypted);
+                controller.close();
+            },
+        });
+    }
+
+    return encrypted;
+}
+
+/**
+ * Decrypts encrypted binary OpenPGP payloads using an armored private key.
+ * @async
+ * @param {Uint8Array} encryptedBinary
+ * @param {string} privateKeyArmored
+ * @param {string} passphrase
+ * @returns {Promise<Uint8Array>}
+ */
+export async function decryptBinaryMessageWithKey(encryptedBinary, privateKeyArmored, passphrase) {
+    if (!(encryptedBinary instanceof Uint8Array) || encryptedBinary.length === 0) {
+        throw new Error('Encrypted binary payload is required.');
+    }
+    if (!privateKeyArmored || !passphrase) {
+        throw new Error('Private key and passphrase are required.');
+    }
+
+    const privateKey = await openpgp.readPrivateKey({ armoredKey: privateKeyArmored });
+    const decryptedKey = await openpgp.decryptKey({ privateKey, passphrase });
+    const message = await openpgp.readMessage({ binaryMessage: encryptedBinary });
+
+    const { data } = await openpgp.decrypt({
+        message,
+        decryptionKeys: decryptedKey,
+        format: 'binary',
+    });
+
+    if (data instanceof Uint8Array) return data;
+    return new TextEncoder().encode(String(data));
+}
